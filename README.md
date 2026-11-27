@@ -49,6 +49,18 @@ To override the **next human task only**, run `/fusion single`, `/fusion cascade
 
 Overrides **do not bypass** Pi effort or review budgets: Standard permits only Single, Max cannot Cascade and always starts strong, High Cascade always starts fast, and a reviewer cap can disallow review. If the effort changes after queuing to an incompatible level, routing explicitly fails rather than silently changing workflows; change the level back or clear/requeue. A soft task-cost limit may still skip the requested review, and the status says why. For forced Single or High Critique, the router only picks the initial author tier; fixed-tier workflows do not call the router. If routing times out or returns invalid output, forced workflows retain their workflow with the configured default author (Max uses strong); ordinary adaptive routing shows a status and runs Single with the default author at Standard/High, or strong at Max. If the judge fails, the draft completes with a visible incomplete-review status; if some critics fail, their failures accompany the successful findings for revision. If all critics fail, the draft completes with an incomplete-review status. Escape/cancellation skips further review or revision and propagates to nested calls.
 
+## Choosing an effort
+
+The router picks the workflow and the effort sets which choices are allowed, so pick the level that matches how much you would otherwise verify by hand:
+
+| Effort | Typical workflow | Use when | Relative cost |
+| --- | --- | --- | --- |
+| **Low / Medium** (Standard) | Single | The change is clear and self-contained, and you want one author with no review latency | lowest |
+| **High** (High) | Cascade, or Critique with a reviewer limit of 2+ | The change is worth a second look, and defects would surface in the diff, status, or recorded tool output | draft plus review, plus one revision if escalated |
+| **XHigh** (Max) | strong Single, or parallel Critique | The spec is ambiguous or the change is high-risk or cross-cutting, so independent disagreement is worth paying for | highest; every author is strong |
+
+These are heuristics, not routing rules: budgets, overrides, and fallbacks still decide what runs, and the status line reports the actual workflow. Prefer a direct physical model for one-line edits, exploratory back-and-forth, or anything needing more than the single review round and revision Fusion provides.
+
 ## Requirements
 
 - Pi 1.6.0 or newer (developed against Pi 1.6.1)
