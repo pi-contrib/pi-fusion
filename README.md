@@ -1,6 +1,10 @@
 # Pi Fusion
 
-One selectable virtual model for [Pi](https://pi.dev) with task-aware Standard, High, and Max effort. Inspired by, not an exact implementation of, GitHub Copilot's orchestration.
+> One selectable virtual model for [Pi](https://pi.dev) with task-aware Standard, High, and Max effort — inspired by, but not an exact implementation of, GitHub Copilot's orchestration.
+
+[![CI](https://github.com/pi-contrib/pi-fusion/actions/workflows/ci.yml/badge.svg)](https://github.com/pi-contrib/pi-fusion/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pi-contrib/pi-fusion)](https://github.com/pi-contrib/pi-fusion/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## How it works
 
