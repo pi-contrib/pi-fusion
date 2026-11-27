@@ -39,7 +39,17 @@ For a reproducible install, append a release tag (GitHub) or version (npm). Rest
 
 ## Configuration
 
-Create `.pi/fusion.json` in your working directory (or set `PI_FUSION_CONFIG` to an absolute path). Start with [examples/fusion.json](examples/fusion.json) and change the provider/model IDs to models in your Pi catalog with credentials. The example needs TypeSafe and OpenAI Codex access. The `router`, `fast`, `strong`, `judge`, and each `critics` entry are independent physical models; they may share the same provider/model. `defaultAuthor` is `fast` or `strong`; `timeoutMs` bounds internal calls. No role may point to `fusion/auto`.
+Copy [examples/fusion.json](examples/fusion.json) to `~/.config/pi/fusion.json` (or `$XDG_CONFIG_HOME/pi/fusion.json` when `XDG_CONFIG_HOME` is an absolute path) and change the provider/model IDs to models in your Pi catalog with credentials. A project-local `.pi/fusion.json` overrides the user config; `PI_FUSION_CONFIG` overrides both (absolute paths recommended, relative paths resolve from the working directory). Config is cached by resolved path for the Pi session; restart or `/reload` after changing a file. Projects without an override use the global config. The example needs TypeSafe and OpenAI Codex access. The `router`, `fast`, `strong`, `judge`, and each `critics` entry are independent physical models; they may share the same provider/model. `defaultAuthor` is `fast` or `strong`; `timeoutMs` bounds each internal call. No role may point to `fusion/auto`.
+
+An optional `budget` object controls extra review work, without changing Pi's author reasoning level:
+
+```json
+"budget": { "maxReviewerCalls": 2, "maxTaskCostUsd": 1.00, "maxReviewMs": 15000 }
+```
+
+- `maxReviewerCalls` is a nonnegative integer: `0` restricts routing to Single, `1` permits High Cascade, and `2` or more permits parallel Critique (up to the configured number of critics). Max always starts strong. The cap is enforced in routing and at review.
+- `maxTaskCostUsd` is a **soft review-start threshold**, not a spending cap: when reported router cost alone reaches it, Fusion routes Single; otherwise, if the observed cost of the current task's author messages plus reported router cost reaches it, Fusion keeps the draft and skips optional review. It cannot predict or stop the author's next tool/model call, nor account for unreported usage or all reviewer charges. No automatic downgrade of a selected author occurs. The status explains when review is skipped.
+- `maxReviewMs` limits the whole judge/parallel-critic round (in addition to `timeoutMs` per call). On timeout Fusion keeps the draft without revision; it does not time-limit the author or revision. Cancellation still propagates. All three fields are optional; leaving out `budget` preserves existing behavior.
 
 The router first uses Pi's classifier registry when the selected decision model is present (for example `typesafe/jev-latest`). For OpenCode Go's `opencode/jev-1.14`, `opencode/gemini-decision-1`, and `opencode/gpt-6-luna-decision`, it can use the shared System One endpoint with `OPENCODE_API_KEY` if those models are not in Pi's classifier catalog. A configured, available Pi chat model instead returns validated JSON using the same rubric (for example a Muse Ember chat model). The four editable runtime prompts are in [src/prompts.ts](src/prompts.ts); workflow limits live in TypeScript.
 

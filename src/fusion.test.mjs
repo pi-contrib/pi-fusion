@@ -123,6 +123,63 @@ test("chat routing enforces effort and falls back on forbidden answers", async (
       assert.equal(result.workflow, "single");
   }
 });
+test("reviewer caps constrain router choices and preserve Max strong-first", async () => {
+  for (const [level, cap, reply, expectedWorkflow, expectedTier] of [
+    ["high", 0, '{"workflow":"critique","tier":"fast"}', "single", "fast"],
+    ["high", 1, '{"workflow":"cascade","tier":"fast"}', "cascade", "fast"],
+    ["high", 1, '{"workflow":"critique","tier":"fast"}', "single", "fast"],
+    [
+      "high",
+      2,
+      '{"workflow":"critique","tier":"strong"}',
+      "critique",
+      "strong",
+    ],
+    ["xhigh", 1, '{"workflow":"critique","tier":"strong"}', "single", "strong"],
+  ]) {
+    const ctx = mock({ router: reply });
+    const cfg = { ...config, budget: { maxReviewerCalls: cap } };
+    const result = await choose(ctx, cfg, { thinkingLevel: level }, user);
+    assert.equal(result.workflow, expectedWorkflow);
+    assert.equal(result.tier, expectedTier);
+    assert.equal(result.reviewerLimit, cap);
+    assert.match(
+      ctx.calls[0].prompt,
+      new RegExp(
+        `Allowed workflows: ${cap === 0 || level === "xhigh" ? "single" : "single, cascade"}`,
+      ),
+    );
+  }
+  const ctx = mock({ c1: '{"findings":"one"}', c2: '{"findings":"two"}' });
+  const limited = { ...state("critique"), reviewerLimit: 1 };
+  await review(ctx, config, limited, "draft");
+  assert.deepEqual(
+    ctx.calls.map((call) => call.id),
+    ["c1"],
+  );
+});
+test("reported router cost can disable optional review before drafting", async () => {
+  const ctx = mock({});
+  ctx.modelRegistry.findOfType = () => ({});
+  ctx.modelRegistry.classify = async () => ({
+    stopReason: "stop",
+    answers: {
+      workflow: { type: "choice", choice: "critique" },
+      tier: { type: "choice", choice: "strong" },
+    },
+    usage: { cost: { total: 0.6 } },
+  });
+  const routed = await choose(
+    ctx,
+    { ...config, budget: { maxTaskCostUsd: 0.5 } },
+    { thinkingLevel: "xhigh" },
+    user,
+  );
+  assert.equal(routed.workflow, "single");
+  assert.equal(routed.tier, "strong");
+  assert.equal(routed.routingCostUsd, 0.6);
+  assert.match(routed.budgetNote, /review disabled/);
+});
 test("routing timeout falls back by effort; cancellation propagates", async () => {
   const ctx = mock(
     { router: "{}" },

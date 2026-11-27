@@ -1,11 +1,11 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { configPath, loadConfig } from "./config.ts";
 import {
   advance,
+  bounded,
   type Config,
   choose,
   effortLabel,
@@ -14,30 +14,10 @@ import {
   review,
   revisionMessage,
   type State,
+  type Transition,
   text,
 } from "./fusion.ts";
 
-function config(cwd: string): Config {
-  const path = resolve(cwd, process.env.PI_FUSION_CONFIG ?? ".pi/fusion.json");
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Config;
-  for (const role of [
-    parsed.router,
-    parsed.fast,
-    parsed.strong,
-    parsed.judge,
-    ...(parsed.critics ?? []),
-  ]) {
-    if (!role?.provider || !role.id || role.provider === "fusion")
-      throw new Error(`Invalid physical model in ${path}`);
-  }
-  if (
-    !parsed.critics?.length ||
-    !["fast", "strong"].includes(parsed.defaultAuthor)
-  )
-    throw new Error(`Invalid fusion configuration: ${path}`);
-  parsed.timeoutMs ??= 15000;
-  return parsed;
-}
 function branchState(ctx: ExtensionContext): State | undefined {
   const branch = ctx.sessionManager.getBranch();
   const phase = branch.findLast(
@@ -92,9 +72,39 @@ async function evidence(
   const status = await pi.exec("git", ["status", "--short"], { cwd: ctx.cwd });
   return `Draft and tool/check results:\n${draft}\n\nGit status (untracked files are listed but not in diff):\n${status.stdout}\nGit diff:\n${diff.stdout.slice(0, 24000)}`;
 }
+export function observedTaskCost(
+  ctx: ExtensionContext,
+  state: State,
+): number | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  const start = branch.findLastIndex(
+    (e) =>
+      e.type === "message" &&
+      e.message.role === "user" &&
+      e.message.timestamp === state.task,
+  );
+  if (start < 0) return undefined;
+  return branch.slice(start + 1).reduce((total, e) => {
+    if (e.type !== "message" || e.message.role !== "assistant") return total;
+    const cost = e.message.usage?.cost.total;
+    return (
+      total +
+      (typeof cost === "number" && Number.isFinite(cost) && cost > 0 ? cost : 0)
+    );
+  }, state.routingCostUsd ?? 0);
+}
+
 export default function (pi: ExtensionAPI) {
-  let settings: Config | undefined;
-  const load = (cwd: string) => (settings ??= config(cwd));
+  const settings = new Map<string, Config>();
+  const load = (cwd: string) => {
+    const path = configPath(cwd);
+    let cfg = settings.get(path);
+    if (!cfg) {
+      cfg = loadConfig(path);
+      settings.set(path, cfg);
+    }
+    return cfg;
+  };
   pi.registerVirtualModel<State>({
     provider: "fusion",
     id: "auto",
@@ -122,7 +132,7 @@ export default function (pi: ExtensionAPI) {
       const model = physical(ctx, state.author);
       ctx.ui.setStatus(
         "fusion",
-        `${effortLabel(state.effort)} · ${state.workflow} · ${state.phase === "draft" ? "drafting" : state.phase === "revision" ? "revising" : "done"} · ${state.author.provider}/${state.author.id}`,
+        `${effortLabel(state.effort)} · ${state.workflow} · ${state.phase === "draft" ? "drafting" : state.phase === "revision" ? "revising" : "done"} · ${state.author.provider}/${state.author.id}${state.budgetNote ? ` · ${state.budgetNote}` : ""}`,
       );
       return {
         model,
@@ -141,17 +151,48 @@ export default function (pi: ExtensionAPI) {
     const cfg = load(ctx.cwd);
     const state = branchState(ctx);
     if (state?.phase !== "draft") return;
+    const spent = observedTaskCost(ctx, state);
+    const overBudget =
+      state.workflow !== "single" &&
+      cfg.budget?.maxTaskCostUsd !== undefined &&
+      spent !== undefined &&
+      spent >= cfg.budget.maxTaskCostUsd;
     const proof =
-      state.workflow === "single" ? "" : await evidence(pi, ctx, state);
-    if (state.workflow !== "single")
+      state.workflow === "single" || overBudget
+        ? ""
+        : await evidence(pi, ctx, state);
+    if (state.workflow !== "single" && !overBudget)
       ctx.ui.setStatus(
         "fusion",
         `${effortLabel(state.effort)} · ${state.workflow} · ${state.workflow === "cascade" ? "judging" : "reviewing"}`,
       );
-    const transition =
-      state.workflow === "single"
-        ? advance(state, cfg, {})
-        : await review(ctx, cfg, state, proof, ctx.signal);
+    let transition: Transition;
+    if (overBudget) {
+      transition = {
+        phase: "done" as const,
+        author: state.author,
+        note: `Review skipped: observed task cost ~$${spent?.toFixed(2)} reached $${cfg.budget?.maxTaskCostUsd?.toFixed(2)} soft limit`,
+      };
+    } else if (state.workflow === "single") {
+      transition = advance(state, cfg, {});
+    } else if (cfg.budget?.maxReviewMs !== undefined) {
+      try {
+        transition = await bounded(
+          (signal) => review(ctx, cfg, state, proof, signal),
+          ctx.signal,
+          cfg.budget.maxReviewMs,
+        );
+      } catch (error) {
+        if (ctx.signal?.aborted) throw error;
+        transition = {
+          phase: "done" as const,
+          author: state.author,
+          note: "Review timed out; draft kept",
+        };
+      }
+    } else {
+      transition = await review(ctx, cfg, state, proof, ctx.signal);
+    }
     if (
       transition.note.includes("could not complete") ||
       transition.feedback?.includes("Review could not complete")
