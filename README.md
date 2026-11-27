@@ -1,18 +1,20 @@
 # Pi Fusion
 
-One selectable virtual model for [Pi](https://pi.dev) that chooses Single, Cascade, or Critique for each new task. Inspired by GitHub Copilot Fusion.
+One selectable virtual model for [Pi](https://pi.dev) with task-aware Standard, High, and Max effort. Inspired by, not an exact implementation of, GitHub Copilot's orchestration.
 
 ## How it works
 
-Select `fusion/auto` once. A routing model uses the same rubric at every effort level (Pi's thinking level) to select a workflow and initial author tier. The chosen physical author works in Pi's ordinary streaming agent loop, including tools and retries. The initial draft may be visible before review.
+Select `fusion/auto` once, then use Pi's thinking-level selector. Pi's visible labels remain **Low / Medium / High / XHigh**; Fusion maps **Low and Medium → Fusion Standard**, **High → Fusion High**, and **XHigh → Fusion Max**. Pi 1.6.1 does not support custom virtual-model thinking-level labels. Fusion Fast is not user-selectable. Low and Medium share the Standard orchestration policy but retain their respective physical-model reasoning budgets.
+
+The router applies the same task-aware rubric within each effort's allowed choices. **Standard** always runs Single, choosing fast or strong once without judges or critics. **High** can choose Single, fast-first Cascade, or Critique; Single and Critique may start fast or strong. **Max** always starts strong and chooses Single for straightforward tasks or parallel Critique when risk or complexity warrants it; Cascade is excluded. The chosen physical author works in Pi's ordinary streaming agent loop, including tools and retries. The initial draft may be visible before review.
 
 - **Single**: one author completes the task without review.
 - **Cascade**: an efficient author drafts; after its tool work finishes, a judge accepts or escalates. Acceptance ends immediately; escalation sends specific findings and evidence to the configured stronger author for one revision.
 - **Critique**: one author drafts; configured critics evaluate the same draft independently in parallel. Their separate findings, including disagreements, go back to the **original** author for one revision. Critics have no tools or write access.
 
-Reviews start at Pi's `agent_before_settle` boundary, after automatic recovery and queued work. A task has at most one review round and one revision. The active author alone can edit. Continuations and retries preserve the current author; direct calls route to the default physical author. State follows session branches. Status displays the workflow, author, and stage; the draft and review/revision can appear as separate streamed responses. Git diff/status and the recorded tool/check results accompany the draft (untracked contents are not included). Checks are not run automatically by Fusion.
+Reviews start at Pi's `agent_before_settle` boundary, after automatic recovery and queued work. A task has at most one review round and one revision. The active author alone can edit. Continuations and retries preserve the current author; direct calls route to the default physical author. State follows session branches. Status displays Fusion Standard/High/Max, the workflow, author, and current drafting/judging/reviewing/escalation/revision stage; the draft and review/revision can appear as separate streamed responses. Git diff/status and the recorded tool/check results accompany the draft (untracked contents are not included). Checks are not run automatically by Fusion.
 
-If routing times out or returns invalid output, Fusion shows a status and runs Single with the default author. If the judge fails, the draft completes with a visible incomplete-review status; if some critics fail, their failures accompany the successful findings for revision. If all critics fail, the draft completes with an incomplete-review status. Escape/cancellation skips further review or revision and propagates to nested calls.
+If routing times out or returns invalid output, Fusion shows a status and runs Single with the default author at Standard/High, or strong at Max. If the judge fails, the draft completes with a visible incomplete-review status; if some critics fail, their failures accompany the successful findings for revision. If all critics fail, the draft completes with an incomplete-review status. Escape/cancellation skips further review or revision and propagates to nested calls.
 
 ## Requirements
 
@@ -41,7 +43,7 @@ Create `.pi/fusion.json` in your working directory (or set `PI_FUSION_CONFIG` to
 
 The router first uses Pi's classifier registry when the selected decision model is present (for example `typesafe/jev-latest`). For OpenCode Go's `opencode/jev-1.14`, `opencode/gemini-decision-1`, and `opencode/gpt-6-luna-decision`, it can use the shared System One endpoint with `OPENCODE_API_KEY` if those models are not in Pi's classifier catalog. A configured, available Pi chat model instead returns validated JSON using the same rubric (for example a Muse Ember chat model). The four editable runtime prompts are in [src/prompts.ts](src/prompts.ts); workflow limits live in TypeScript.
 
-Select the model with `/model` → `fusion/auto`, or run `pi --model fusion/auto`. For example, ask: “Add a regression test for the parser bug and fix it.” At medium effort, a Cascade selection lets the efficient author inspect and edit the parser and run tests. The judge sees the original request, completed draft, test output, and diff; if it finds the regression test missing, the stronger author receives that specific finding for one final revision. At high effort an ambiguous task may instead get parallel Critique.
+Select the model with `/model` → `fusion/auto`, or run `pi --model fusion/auto`. For example, ask: “Add a regression test for the parser bug and fix it.” At **Fusion Standard** (Pi Low or Medium), one selected author inspects and edits the parser and runs tests without a judge. At **Fusion High** (Pi High), the router may instead choose Cascade: the fast author drafts and a judge sees the request, draft, test output, and diff; if the regression test is missing, the strong author gets that finding for one final revision. At **Fusion Max** (Pi XHigh), an ambiguous or high-risk change may get parallel Critique and one revision by the same strong author; a straightforward change may use strong Single.
 
 ## Development
 

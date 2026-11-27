@@ -8,6 +8,7 @@ import {
   advance,
   type Config,
   choose,
+  effortLabel,
   lastUser,
   physical,
   review,
@@ -121,7 +122,7 @@ export default function (pi: ExtensionAPI) {
       const model = physical(ctx, state.author);
       ctx.ui.setStatus(
         "fusion",
-        `${state.workflow} · ${state.phase} · ${state.author.provider}/${state.author.id}`,
+        `${effortLabel(state.effort)} · ${state.workflow} · ${state.phase === "draft" ? "drafting" : state.phase === "revision" ? "revising" : "done"} · ${state.author.provider}/${state.author.id}`,
       );
       return {
         model,
@@ -145,7 +146,7 @@ export default function (pi: ExtensionAPI) {
     if (state.workflow !== "single")
       ctx.ui.setStatus(
         "fusion",
-        `${state.workflow} · ${state.workflow === "cascade" ? "judging" : "reviewing"}`,
+        `${effortLabel(state.effort)} · ${state.workflow} · ${state.workflow === "cascade" ? "judging" : "reviewing"}`,
       );
     const transition =
       state.workflow === "single"
@@ -161,7 +162,10 @@ export default function (pi: ExtensionAPI) {
       phase: transition.phase,
       author: transition.author,
     };
-    ctx.ui.setStatus("fusion", `${state.workflow} · ${transition.note}`);
+    ctx.ui.setStatus(
+      "fusion",
+      `${effortLabel(state.effort)} · ${state.workflow} · ${transition.phase === "revision" ? (state.workflow === "cascade" ? "escalating" : "revising") : "done"} · ${transition.note}`,
+    );
     const entries = [
       ...event.entries,
       { type: "custom" as const, customType: "fusion.phase", data },
@@ -177,6 +181,7 @@ export default function (pi: ExtensionAPI) {
     return { entries, continue: transition.phase === "revision" };
   });
   pi.on("agent_settled", (event, ctx) => {
-    if (event.aborted) ctx.ui.setStatus("fusion", "Cancelled; review skipped");
+    if (event.aborted)
+      ctx.ui.setStatus("fusion", "Fusion · Cancelled; review skipped");
   });
 }

@@ -13,6 +13,41 @@ import {
 export type Ref = { provider: string; id: string };
 export type Workflow = "single" | "cascade" | "critique";
 export type Tier = "fast" | "strong";
+export type FusionEffort = "standard" | "high" | "max";
+export type Route = { workflow: Workflow; tier: Tier };
+
+export function fusionEffort(level: string): FusionEffort {
+  return level === "xhigh" ? "max" : level === "high" ? "high" : "standard";
+}
+export function effortLabel(effort: FusionEffort): string {
+  return `Fusion ${effort[0].toUpperCase()}${effort.slice(1)}`;
+}
+export function routeOptions(effort: FusionEffort): {
+  workflows: Workflow[];
+  tiers: Tier[];
+} {
+  return effort === "standard"
+    ? { workflows: ["single"], tiers: ["fast", "strong"] }
+    : effort === "max"
+      ? { workflows: ["single", "critique"], tiers: ["strong"] }
+      : {
+          workflows: ["single", "cascade", "critique"],
+          tiers: ["fast", "strong"],
+        };
+}
+export function validateRoute(value: unknown, effort: FusionEffort): Route {
+  if (!value || typeof value !== "object") throw new Error("Invalid route");
+  const v = value as Record<string, unknown>;
+  const { workflows, tiers } = routeOptions(effort);
+  if (
+    !workflows.includes(v.workflow as Workflow) ||
+    !tiers.includes(v.tier as Tier)
+  )
+    throw new Error("Route not allowed at this effort");
+  if (v.workflow === "cascade" && v.tier !== "fast")
+    throw new Error("Cascade must start fast");
+  return { workflow: v.workflow as Workflow, tier: v.tier as Tier };
+}
 export type Config = {
   router: Ref;
   fast: Ref;
@@ -25,6 +60,7 @@ export type Config = {
 export type State = {
   task: number;
   request: string;
+  effort: FusionEffort;
   workflow: Workflow;
   tier: Tier;
   phase: "draft" | "revision" | "done";
@@ -64,7 +100,7 @@ export function physical(ctx: ExtensionContext, ref: Ref): Model<Api> {
     );
   return model;
 }
-export function parseRoute(value: unknown): { workflow: Workflow; tier: Tier } {
+export function parseRoute(value: unknown): Route {
   if (!value || typeof value !== "object") throw new Error("Invalid route");
   const v = value as Record<string, unknown>;
   if (
@@ -144,27 +180,47 @@ async function classify(
   ctx: ExtensionContext,
   ref: Ref,
   request: string,
-  effort: string,
+  effort: FusionEffort,
   signal: AbortSignal,
-): Promise<{ workflow: Workflow; tier: Tier }> {
+): Promise<Route> {
+  const { workflows, tiers } = routeOptions(effort);
   const questions = {
-    workflow: {
-      type: "choice" as const,
-      instructions: routePrompt,
-      criteria: {
-        single: "Routine clear task",
-        cascade: "Draft then gate",
-        critique: "Independent parallel review",
-      },
-    },
-    tier: {
-      type: "choice" as const,
-      instructions:
-        "Choose the initial author tier using the same routing rubric.",
-      criteria: { fast: "Efficient author", strong: "Stronger author" },
-    },
+    ...(workflows.length > 1
+      ? {
+          workflow: {
+            type: "choice" as const,
+            instructions: routePrompt,
+            criteria: Object.fromEntries(
+              workflows.map((w) => [
+                w,
+                {
+                  single: "Routine clear task",
+                  cascade: "Fast draft with escalation gate",
+                  critique: "Independent parallel review",
+                }[w],
+              ]),
+            ),
+          },
+        }
+      : {}),
+    ...(tiers.length > 1
+      ? {
+          tier: {
+            type: "choice" as const,
+            instructions: routePrompt,
+            criteria: { fast: "Efficient author", strong: "Stronger author" },
+          },
+        }
+      : {}),
   };
-  const payload = { state: { request, effort }, questions };
+  const payload = {
+    state: {
+      request,
+      effort,
+      allowed: { workflows, tiers, cascadeStartsFast: true },
+    },
+    questions,
+  };
   const model = ctx.modelRegistry.findOfType(
     "classifier",
     ref.provider,
@@ -174,16 +230,23 @@ async function classify(
     const result = await ctx.modelRegistry.classify(model, payload, { signal });
     if (result.stopReason !== "stop")
       throw new Error(result.errorMessage ?? "Classifier failed");
-    return parseRoute({
-      workflow:
-        result.answers.workflow?.type === "choice"
-          ? result.answers.workflow.choice
-          : undefined,
-      tier:
-        result.answers.tier?.type === "choice"
-          ? result.answers.tier.choice
-          : undefined,
-    });
+    return validateRoute(
+      {
+        workflow:
+          result.answers.workflow?.type === "choice"
+            ? result.answers.workflow.choice
+            : workflows.length === 1
+              ? workflows[0]
+              : undefined,
+        tier:
+          result.answers.tier?.type === "choice"
+            ? result.answers.tier.choice
+            : tiers.length === 1
+              ? tiers[0]
+              : undefined,
+      },
+      effort,
+    );
   }
   if (
     ref.provider !== "opencode" ||
@@ -208,10 +271,17 @@ async function classify(
   const data = (await response.json()) as {
     answers?: Record<string, { choice?: string }>;
   };
-  return parseRoute({
-    workflow: data.answers?.workflow?.choice,
-    tier: data.answers?.tier?.choice,
-  });
+  return validateRoute(
+    {
+      workflow:
+        data.answers?.workflow?.choice ??
+        (workflows.length === 1 ? workflows[0] : undefined),
+      tier:
+        data.answers?.tier?.choice ??
+        (tiers.length === 1 ? tiers[0] : undefined),
+    },
+    effort,
+  );
 }
 export async function choose(
   ctx: ExtensionContext,
@@ -220,7 +290,9 @@ export async function choose(
   task: Message,
 ): Promise<State> {
   const original = text(task);
-  let choice: { workflow: Workflow; tier: Tier };
+  const effort = fusionEffort(request.thinkingLevel);
+  const allowed = routeOptions(effort);
+  let choice: Route;
   try {
     choice = await bounded(
       async (signal) => {
@@ -232,22 +304,27 @@ export async function choose(
             config.router.id,
           )
         )
-          return classify(
+          return classify(ctx, config.router, original, effort, signal);
+        const answer = parseJson(
+          await chat(
             ctx,
             config.router,
-            original,
-            request.thinkingLevel,
+            `${routePrompt}\nTask: ${original}\nFusion effort: ${effort}\nAllowed workflows: ${allowed.workflows.join(", ")}\nAllowed initial tiers: ${allowed.tiers.join(", ")} (Cascade always starts fast).\nReturn JSON only with workflow${allowed.tiers.length > 1 ? " and tier" : ""}.`,
             signal,
-          );
-        return parseRoute(
-          parseJson(
-            await chat(
-              ctx,
-              config.router,
-              `${routePrompt}\nTask: ${original}\nEffort: ${request.thinkingLevel}\nReturn JSON only: {"workflow":"single|cascade|critique","tier":"fast|strong"}`,
-              signal,
-            ),
           ),
+        );
+        return validateRoute(
+          {
+            workflow:
+              answer.workflow ??
+              (allowed.workflows.length === 1
+                ? allowed.workflows[0]
+                : undefined),
+            tier:
+              answer.tier ??
+              (allowed.tiers.length === 1 ? allowed.tiers[0] : undefined),
+          },
+          effort,
         );
       },
       request.signal,
@@ -255,12 +332,19 @@ export async function choose(
     );
   } catch (error) {
     if (request.signal?.aborted) throw error;
-    ctx.ui.setStatus("fusion", "Routing unavailable; Single (default author)");
-    choice = { workflow: "single", tier: config.defaultAuthor };
+    ctx.ui.setStatus(
+      "fusion",
+      `${effortLabel(effort)} · Routing unavailable; Single (${effort === "max" ? "strong" : "default author"})`,
+    );
+    choice = {
+      workflow: "single",
+      tier: effort === "max" ? "strong" : config.defaultAuthor,
+    };
   }
   return {
     task: task.timestamp,
     request: original,
+    effort,
     ...choice,
     author: config[choice.tier],
     phase: "draft",
