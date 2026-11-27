@@ -10,12 +10,17 @@ import {
   type Config,
   choose,
   effortLabel,
+  fusionEffort,
+  isWorkflow,
   lastUser,
   physical,
   review,
   revisionMessage,
+  routeOptions,
   type State,
   type Transition,
+  type Workflow,
+  workflowLimit,
 } from "./fusion.ts";
 
 function branchState(ctx: ExtensionContext): State | undefined {
@@ -45,6 +50,42 @@ function branchState(ctx: ExtensionContext): State | undefined {
     ? { ...base, phase: update.phase, author: update.author }
     : base;
 }
+export function pendingOverride(
+  ctx: ExtensionContext,
+  task?: number,
+): Workflow | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  const index = branch.findLastIndex(
+    (entry) => entry.type === "custom" && entry.customType === "fusion.next",
+  );
+  if (index < 0) return;
+  const selected = branch[index];
+  const value =
+    selected.type === "custom"
+      ? (selected.data as { workflow?: unknown } | undefined)?.workflow
+      : undefined;
+  if (typeof value !== "string" || !isWorkflow(value)) return;
+  const later = branch.slice(index + 1);
+  if (
+    later.some(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "pi.virtual-model-state" &&
+        (entry.data as { provider?: string })?.provider === "fusion",
+    )
+  )
+    return;
+  const firstUser = later.find(
+    (entry) => entry.type === "message" && entry.message.role === "user",
+  );
+  if (
+    firstUser?.type === "message" &&
+    (task === undefined || firstUser.message.timestamp !== task)
+  )
+    return;
+  return value;
+}
+
 export function observedTaskCost(
   ctx: ExtensionContext,
   state: State,
@@ -78,6 +119,64 @@ export default function (pi: ExtensionAPI) {
     }
     return cfg;
   };
+  pi.registerCommand("fusion", {
+    description:
+      "Force Single, Cascade or Critique for the next Fusion task; auto clears",
+    getArgumentCompletions: (prefix) =>
+      ["single", "cascade", "critique", "auto"]
+        .filter((value) => value.startsWith(prefix.trim().toLowerCase()))
+        .map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      if (
+        ctx.model?.provider !== "fusion" ||
+        ctx.model.id !== "auto" ||
+        !ctx.isIdle()
+      ) {
+        ctx.ui.notify(
+          "Select fusion/auto and wait for the agent to finish first",
+          "warning",
+        );
+        return;
+      }
+      const value = args.trim().toLowerCase();
+      if (value !== "auto" && !isWorkflow(value)) {
+        ctx.ui.notify("Usage: /fusion single|cascade|critique|auto", "warning");
+        return;
+      }
+      if (value !== "auto") {
+        const effort = fusionEffort(ctx.thinkingLevel ?? pi.getThinkingLevel());
+        const allowed = routeOptions(effort, workflowLimit(load(ctx.cwd)));
+        if (!allowed.workflows.includes(value)) {
+          ctx.ui.notify(
+            `${effortLabel(effort)} cannot use ${value} with the current reviewer cap`,
+            "warning",
+          );
+          return;
+        }
+      }
+      pi.appendEntry("fusion.next", {
+        workflow: value === "auto" ? null : value,
+      });
+      ctx.ui.setStatus(
+        "fusion",
+        value === "auto"
+          ? "Fusion · adaptive routing"
+          : `Fusion · next task: ${value}`,
+      );
+      ctx.ui.notify(
+        value === "auto"
+          ? "Fusion override cleared"
+          : `Fusion override queued: ${value}`,
+        "info",
+      );
+    },
+  });
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.model?.provider === "fusion" && ctx.model.id === "auto") {
+      const queued = pendingOverride(ctx);
+      if (queued) ctx.ui.setStatus("fusion", `Fusion · next task: ${queued}`);
+    }
+  });
   pi.registerVirtualModel<State>({
     provider: "fusion",
     id: "auto",
@@ -97,10 +196,25 @@ export default function (pi: ExtensionAPI) {
         request.reason === "user" &&
         user &&
         (!existing || user.timestamp !== existing.task);
+      const select = async () => {
+        if (!user) return undefined;
+        const forced = pendingOverride(ctx, user.timestamp);
+        try {
+          return await choose(ctx, cfg, request, user, forced);
+        } catch (error) {
+          if (forced) {
+            ctx.ui.setStatus(
+              "fusion",
+              `Fusion · override: ${forced} unavailable`,
+            );
+            ctx.ui.notify(String(error), "warning");
+          }
+          throw error;
+        }
+      };
       const state = fresh
-        ? await choose(ctx, cfg, request, user)
-        : (existing ??
-          (user ? await choose(ctx, cfg, request, user) : undefined));
+        ? await select()
+        : (existing ?? (user ? await select() : undefined));
       if (!state) throw new Error("Fusion needs a user request");
       const model = physical(ctx, state.author);
       ctx.ui.setStatus(

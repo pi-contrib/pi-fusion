@@ -231,6 +231,166 @@ test("chat routing records consistent categorical signal without an extra call",
   );
   assert.equal(fallback.routeReason, "routing unavailable");
 });
+test("forced routes use only meaningful tier choices; fixed tiers skip router", async () => {
+  const forced = [
+    ["high", "cascade", "fast", 0],
+    ["xhigh", "critique", "strong", 0],
+    ["xhigh", "single", "strong", 0],
+    ["medium", "single", "strong", 1],
+    ["high", "critique", "strong", 1],
+  ];
+  for (const [level, workflow, tier, calls] of forced) {
+    const ctx = mock({ router: '{"tier":"strong"}' });
+    const state = await choose(
+      ctx,
+      config,
+      { thinkingLevel: level },
+      user,
+      workflow,
+    );
+    assert.equal(state.workflow, workflow);
+    assert.equal(state.tier, tier);
+    assert.equal(state.routeReason, `override: ${workflow}`);
+    assert.equal(ctx.calls.length, calls);
+    if (calls) {
+      assert.match(ctx.calls[0].prompt, /choose tier only/);
+      assert.doesNotMatch(
+        ctx.calls[0].prompt,
+        /Return JSON only with workflow/,
+      );
+    }
+  }
+  for (const [level, workflow, cap] of [
+    ["low", "critique", 2],
+    ["high", "critique", 1],
+    ["xhigh", "cascade", 2],
+  ]) {
+    const cfg = { ...config, budget: { maxReviewerCalls: cap } };
+    await assert.rejects(
+      choose(mock({}), cfg, { thinkingLevel: level }, user, workflow),
+      /cannot use/,
+    );
+  }
+});
+test("forced classifier asks tier only, contradictory or invalid answers retain forced workflow with default author", async () => {
+  const calls = [];
+  let answers = { tier: { type: "choice", choice: "strong" } };
+  const ctx = mock({});
+  ctx.modelRegistry.findOfType = () => ({});
+  ctx.modelRegistry.classify = async (_, payload) => {
+    calls.push(payload);
+    return { stopReason: "stop", answers };
+  };
+  let result = await choose(
+    ctx,
+    config,
+    { thinkingLevel: "high" },
+    user,
+    "critique",
+  );
+  assert.equal(result.tier, "strong");
+  assert.deepEqual(Object.keys(calls[0].questions), ["tier"]);
+  assert.deepEqual(calls[0].state.allowed.workflows, ["critique"]);
+  answers = {
+    workflow: { type: "choice", choice: "single" },
+    tier: { type: "choice", choice: "strong" },
+  };
+  result = await choose(
+    ctx,
+    config,
+    { thinkingLevel: "high" },
+    user,
+    "critique",
+  );
+  assert.equal(result.workflow, "critique");
+  assert.equal(result.tier, "fast");
+  assert.match(
+    result.routeReason,
+    /override: critique.*tier routing unavailable/,
+  );
+  const invalidChat = mock({ router: '{"workflow":"single","tier":"strong"}' });
+  result = await choose(
+    invalidChat,
+    config,
+    { thinkingLevel: "high" },
+    user,
+    "critique",
+  );
+  assert.equal(result.workflow, "critique");
+  assert.equal(result.tier, "fast");
+  assert.match(result.routeReason, /tier routing unavailable/);
+  const hanging = mock(
+    { router: "{}" },
+    () => new Promise((resolve) => setTimeout(resolve, 50)),
+  );
+  result = await choose(
+    hanging,
+    { ...config, timeoutMs: 5 },
+    { thinkingLevel: "high" },
+    user,
+    "critique",
+  );
+  assert.equal(result.workflow, "critique");
+  assert.equal(result.tier, "fast");
+  const cancelled = new AbortController();
+  cancelled.abort(new Error("cancelled"));
+  await assert.rejects(
+    choose(
+      ctx,
+      config,
+      { thinkingLevel: "high", signal: cancelled.signal },
+      user,
+      "critique",
+    ),
+    /cancelled/,
+  );
+});
+test("forced Critique keeps the initial author after parallel review and stops after one revision", async () => {
+  const ctx = mock({
+    router: '{"tier":"strong"}',
+    c1: '{"findings":"fix test"}',
+    c2: '{"findings":"check edge"}',
+  });
+  const routed = await choose(
+    ctx,
+    config,
+    { thinkingLevel: "high" },
+    user,
+    "critique",
+  );
+  const next = await review(ctx, config, routed, "draft");
+  assert.equal(next.author.id, "strong");
+  assert.equal(next.phase, "revision");
+  assert.deepEqual(
+    ctx.calls.map((call) => call.id),
+    ["router", "c1", "c2"],
+  );
+  assert.equal(
+    advance({ ...routed, phase: "revision" }, config, {}).phase,
+    "done",
+  );
+});
+test("forced critique still observes task cost and existing review limits", async () => {
+  const ctx = mock({ router: '{"tier":"fast"}' });
+  ctx.modelRegistry.streamSimple = (_, __, ___) => ({
+    result: async () => ({
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: '{"tier":"fast"}' }],
+      usage: { cost: { total: 1 } },
+    }),
+  });
+  const result = await choose(
+    ctx,
+    { ...config, budget: { maxTaskCostUsd: 0.5 } },
+    { thinkingLevel: "high" },
+    user,
+    "critique",
+  );
+  assert.equal(result.workflow, "single");
+  assert.equal(result.override, "critique");
+  assert.match(result.routeReason, /review skipped: task cost limit/);
+});
 test("routing timeout falls back by effort; cancellation propagates", async () => {
   const ctx = mock(
     { router: "{}" },

@@ -15,6 +15,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
   const handlers = {};
   let definition;
   extension({
+    registerCommand() {},
     registerVirtualModel: (d) => {
       definition = d;
     },
@@ -122,6 +123,7 @@ test("Standard runs one author across tools and retry without evidence or review
   let executions = 0;
   const statuses = [];
   extension({
+    registerCommand() {},
     registerVirtualModel: (d) => {
       definition = d;
     },
@@ -195,6 +197,7 @@ test("soft task cost skips review without interrupting author; review timeout ke
   const handlers = {};
   let executions = 0;
   extension({
+    registerCommand() {},
     registerVirtualModel() {},
     on: (name, fn) => {
       handlers[name] = fn;

@@ -8,6 +8,7 @@ import {
   judgePrompt,
   revisePrompt,
   routePrompt,
+  tierPrompt,
 } from "./prompts.ts";
 
 export type Ref = { provider: string; id: string };
@@ -15,6 +16,9 @@ export type Workflow = "single" | "cascade" | "critique";
 export type Tier = "fast" | "strong";
 export type FusionEffort = "standard" | "high" | "max";
 export type Route = { workflow: Workflow; tier: Tier };
+export function isWorkflow(value: string): value is Workflow {
+  return value === "single" || value === "cascade" || value === "critique";
+}
 export type RouteSignal =
   | "straightforward"
   | "complex"
@@ -67,6 +71,11 @@ export function routeOptions(
     tiers: effort === "max" ? ["strong"] : ["fast", "strong"],
   };
 }
+export function workflowLimit(config: Config): number {
+  return config.budget?.maxReviewerCalls === undefined
+    ? Infinity
+    : Math.min(config.critics.length, config.budget.maxReviewerCalls);
+}
 export function validateRoute(
   value: unknown,
   effort: FusionEffort,
@@ -114,6 +123,7 @@ export type State = {
   routingCostUsd?: number;
   budgetNote?: string;
   routeReason?: string;
+  override?: Workflow;
 };
 export type Transition = {
   phase: "done" | "revision";
@@ -236,10 +246,13 @@ async function classify(
   signal: AbortSignal,
   recordCost: (cost: number) => void,
   recordSignal: (signal: unknown) => void,
+  forced?: Workflow,
 ): Promise<Route> {
-  const { workflows, tiers } = routeOptions(effort, reviewerLimit);
+  const options = routeOptions(effort, reviewerLimit);
+  const { tiers } = options;
+  const workflows = forced ? [forced] : options.workflows;
   const questions = {
-    ...(workflows.length > 1
+    ...(!forced && workflows.length > 1
       ? {
           workflow: {
             type: "choice" as const,
@@ -257,22 +270,26 @@ async function classify(
           },
         }
       : {}),
-    signal: {
-      type: "choice" as const,
-      instructions:
-        "Select one short task signal from the shared route rubric. Use straightforward or complex for Single, fast-draft for Cascade, review-risk for Critique.",
-      criteria: {
-        straightforward: "Clear bounded task",
-        complex: "Clear task requiring a stronger author",
-        "fast-draft": "Fast draft with an escalation gate",
-        "review-risk": "Ambiguous, high-risk or cross-cutting task",
-      },
-    },
+    ...(!forced
+      ? {
+          signal: {
+            type: "choice" as const,
+            instructions:
+              "Select one short task signal from the shared route rubric. Use straightforward or complex for Single, fast-draft for Cascade, review-risk for Critique.",
+            criteria: {
+              straightforward: "Clear bounded task",
+              complex: "Clear task requiring a stronger author",
+              "fast-draft": "Fast draft with an escalation gate",
+              "review-risk": "Ambiguous, high-risk or cross-cutting task",
+            },
+          },
+        }
+      : {}),
     ...(tiers.length > 1
       ? {
           tier: {
             type: "choice" as const,
-            instructions: routePrompt,
+            instructions: forced ? tierPrompt : routePrompt,
             criteria: { fast: "Efficient author", strong: "Stronger author" },
           },
         }
@@ -296,6 +313,13 @@ async function classify(
     recordCost(result.usage?.cost.total ?? 0);
     if (result.stopReason !== "stop")
       throw new Error(result.errorMessage ?? "Classifier failed");
+    if (
+      forced &&
+      result.answers.workflow &&
+      (result.answers.workflow.type !== "choice" ||
+        result.answers.workflow.choice !== forced)
+    )
+      throw new Error("Router contradicted workflow override");
     const route = validateRoute(
       {
         workflow:
@@ -346,6 +370,12 @@ async function classify(
     usage?: { cost?: { total?: number } };
   };
   recordCost(data.usage?.cost?.total ?? 0);
+  if (
+    forced &&
+    data.answers?.workflow &&
+    data.answers.workflow.choice !== forced
+  )
+    throw new Error("Router contradicted workflow override");
   const route = validateRoute(
     {
       workflow:
@@ -366,14 +396,31 @@ export async function choose(
   config: Config,
   request: ModelRouteRequest<State>,
   task: Message,
+  forced?: Workflow,
 ): Promise<State> {
   const original = text(task);
   const effort = fusionEffort(request.thinkingLevel);
   const reviewerCap = config.budget?.maxReviewerCalls ?? Infinity;
   const reviewerLimit = Math.min(config.critics.length, reviewerCap);
-  const workflowLimit =
-    config.budget?.maxReviewerCalls === undefined ? Infinity : reviewerLimit;
-  const allowed = routeOptions(effort, workflowLimit);
+  const allowed = routeOptions(effort, workflowLimit(config));
+  if (forced && !allowed.workflows.includes(forced))
+    throw new Error(
+      `${effortLabel(effort)} cannot use ${forced} with the current reviewer cap`,
+    );
+  if (forced && (forced === "cascade" || effort === "max"))
+    return {
+      task: task.timestamp,
+      request: original,
+      effort,
+      workflow: forced,
+      tier: forced === "cascade" ? "fast" : "strong",
+      author: config[forced === "cascade" ? "fast" : "strong"],
+      reviewerLimit,
+      routingCostUsd: 0,
+      routeReason: `override: ${forced}`,
+      override: forced,
+      phase: "draft",
+    };
   let routingCostUsd = 0;
   const recordCost = (cost: number) => {
     if (Number.isFinite(cost) && cost > 0) routingCostUsd += cost;
@@ -400,23 +447,31 @@ export async function choose(
             config.router,
             original,
             effort,
-            workflowLimit,
+            workflowLimit(config),
             signal,
             recordCost,
             recordSignal,
+            forced,
           );
         const answer = parseJson(
           await chat(
             ctx,
             config.router,
-            `${routePrompt}\nTask: ${original}\nFusion effort: ${effort}\nAllowed workflows: ${allowed.workflows.join(", ")}\nAllowed initial tiers: ${allowed.tiers.join(", ")} (Cascade always starts fast).\nReturn JSON only with workflow${allowed.tiers.length > 1 ? ", tier" : ""}, and signal (straightforward|complex|fast-draft|review-risk).`,
+            `${forced ? tierPrompt : routePrompt}\nTask: ${original}\nFusion effort: ${effort}\nAllowed workflows: ${forced ?? allowed.workflows.join(", ")}\nAllowed initial tiers: ${allowed.tiers.join(", ")} (Cascade always starts fast).\n${forced ? `Workflow is fixed to ${forced}; choose tier only. Return JSON only: {"tier":"fast|strong"}.` : `Return JSON only with workflow${allowed.tiers.length > 1 ? ", tier" : ""}, and signal (straightforward|complex|fast-draft|review-risk).`}`,
             signal,
             recordCost,
           ),
         );
+        if (
+          forced &&
+          answer.workflow !== undefined &&
+          answer.workflow !== forced
+        )
+          throw new Error("Router contradicted workflow override");
         const route = validateRoute(
           {
             workflow:
+              forced ??
               answer.workflow ??
               (allowed.workflows.length === 1
                 ? allowed.workflows[0]
@@ -426,9 +481,9 @@ export async function choose(
               (allowed.tiers.length === 1 ? allowed.tiers[0] : undefined),
           },
           effort,
-          workflowLimit,
+          workflowLimit(config),
         );
-        recordSignal(answer.signal);
+        if (!forced) recordSignal(answer.signal);
         return route;
       },
       request.signal,
@@ -439,14 +494,15 @@ export async function choose(
     fallback = true;
     ctx.ui.setStatus(
       "fusion",
-      `${effortLabel(effort)} · Routing unavailable; Single (${effort === "max" ? "strong" : "default author"})`,
+      `${effortLabel(effort)} · Routing unavailable; ${forced ?? "Single"} (${effort === "max" ? "strong" : "default author"})`,
     );
     choice = {
-      workflow: "single",
+      workflow: forced ?? "single",
       tier: effort === "max" ? "strong" : config.defaultAuthor,
     };
   }
   const costLimitReached =
+    choice.workflow !== "single" &&
     config.budget?.maxTaskCostUsd !== undefined &&
     routingCostUsd >= config.budget.maxTaskCostUsd;
   if (costLimitReached)
@@ -461,11 +517,18 @@ export async function choose(
     ...choice,
     reviewerLimit,
     routingCostUsd,
-    routeReason: costLimitReached
-      ? "task cost limit"
-      : fallback
-        ? "routing unavailable"
-        : routeExplanation(signalChoice, choice.workflow, choice.tier),
+    routeReason: forced
+      ? costLimitReached
+        ? `override: ${forced} (review skipped: task cost limit)`
+        : fallback
+          ? `override: ${forced} (tier routing unavailable; default author)`
+          : `override: ${forced}`
+      : costLimitReached
+        ? "task cost limit"
+        : fallback
+          ? "routing unavailable"
+          : routeExplanation(signalChoice, choice.workflow, choice.tier),
+    override: forced,
     budgetNote: costLimitReached
       ? "Router cost reached task soft limit; review disabled"
       : allowed.workflows.length < routeOptions(effort).workflows.length
