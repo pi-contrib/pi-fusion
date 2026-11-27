@@ -24,10 +24,11 @@ test("virtual route persists through tool continuations and retry; direct uses d
   });
   assert.equal(definition.provider, "fusion");
   const entries = [];
+  const statuses = [];
   const user = { role: "user", content: "Fix this", timestamp: 100 };
   const ctx = {
     cwd: process.cwd(),
-    ui: { setStatus() {} },
+    ui: { setStatus: (_, value) => statuses.push(value) },
     sessionManager: { getBranch: () => entries },
     modelRegistry: {
       getAvailable: () => models,
@@ -37,6 +38,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
         answers: {
           workflow: { type: "choice", choice: "cascade" },
           tier: { type: "choice", choice: "fast" },
+          signal: { type: "choice", choice: "fast-draft" },
         },
       }),
     },
@@ -51,6 +53,8 @@ test("virtual route persists through tool continuations and retry; direct uses d
   assert.equal(first.model.id, "gpt-5.6-luna");
   assert.equal(first.state.effort, "high");
   assert.equal(first.state.workflow, "cascade");
+  assert.equal(first.state.routeReason, "router signal: fast-draft");
+  assert.ok(statuses.some((s) => s.includes("router signal: fast-draft")));
   const next = await definition.route(
     {
       ...request,
@@ -61,6 +65,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
     ctx,
   );
   assert.equal(next.model.id, first.model.id);
+  assert.ok(statuses.at(-1).includes(first.state.routeReason));
   const retry = await definition.route(
     {
       ...request,
@@ -99,6 +104,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
     "gpt-5.6-sol",
   );
   assert.ok(handlers.agent_before_settle);
+  assert.ok(statuses.at(-1).includes(first.state.routeReason));
   // A fork with the saved route but without the revision marker retains its original author.
   entries.pop();
   const fork = await definition.route(
@@ -106,6 +112,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
     ctx,
   );
   assert.equal(fork.model.id, "gpt-5.6-luna");
+  assert.ok(statuses.at(-1).includes(first.state.routeReason));
   assert.equal(first.state.effort, "high");
 });
 
@@ -269,7 +276,7 @@ test("soft task cost skips review without interrupting author; review timeout ke
   );
   assert.equal(result.continue, false);
   assert.equal(reviewCalls, 2);
-  assert.equal(executions, 2);
+  assert.equal(executions, 3);
 });
 
 test("classifier offers only meaningful choices and rejects contrary answers", async () => {
@@ -287,11 +294,13 @@ test("classifier offers only meaningful choices and rejects contrary answers", a
     timeoutMs: 1000,
   };
   let answer;
+  let classifyCalls = 0;
   const ctx = {
     ui: { setStatus: (...args) => calls.push(args) },
     modelRegistry: {
       findOfType: () => ({}),
       classify: async (_, payload) => {
+        classifyCalls++;
         calls.push(payload);
         return { stopReason: "stop", answers: answer };
       },
@@ -309,7 +318,9 @@ test("classifier offers only meaningful choices and rejects contrary answers", a
       workflow: { type: "choice", choice: workflow },
       tier: { type: "choice", choice: tier },
     };
+    const before = classifyCalls;
     const state = await choose(ctx, config, { thinkingLevel: level }, user);
+    assert.equal(classifyCalls, before + 1);
     assert.equal(state.workflow, workflow);
     assert.equal(state.tier, tier);
     const payload = calls.findLast((v) => v.state);
@@ -319,7 +330,27 @@ test("classifier offers only meaningful choices and rejects contrary answers", a
       level !== "low" && level !== "medium",
     );
     assert.equal("tier" in payload.questions, level !== "xhigh");
+    assert.deepEqual(Object.keys(payload.questions.signal.criteria), [
+      "straightforward",
+      "complex",
+      "fast-draft",
+      "review-risk",
+    ]);
   }
+  answer = {
+    workflow: { type: "choice", choice: "critique" },
+    tier: { type: "choice", choice: "strong" },
+    signal: { type: "choice", choice: "review-risk" },
+  };
+  assert.equal(
+    (await choose(ctx, config, { thinkingLevel: "high" }, user)).routeReason,
+    "router signal: review-risk",
+  );
+  answer.signal.choice = "malformed";
+  assert.equal(
+    (await choose(ctx, config, { thinkingLevel: "high" }, user)).routeReason,
+    "policy: critique",
+  );
   for (const [level, workflow, tier] of [
     ["low", "cascade", "fast"],
     ["high", "cascade", "strong"],

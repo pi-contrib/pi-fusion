@@ -3,6 +3,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { configPath, loadConfig } from "./config.ts";
+import { evidence } from "./evidence.ts";
 import {
   advance,
   bounded,
@@ -15,7 +16,6 @@ import {
   revisionMessage,
   type State,
   type Transition,
-  text,
 } from "./fusion.ts";
 
 function branchState(ctx: ExtensionContext): State | undefined {
@@ -44,33 +44,6 @@ function branchState(ctx: ExtensionContext): State | undefined {
   return base && update?.task === base.task
     ? { ...base, phase: update.phase, author: update.author }
     : base;
-}
-async function evidence(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  state: State,
-): Promise<string> {
-  const branch = ctx.sessionManager.getBranch();
-  const messages = branch
-    .filter((e) => e.type === "message")
-    .map((e) => e.message);
-  const start = messages.findLastIndex(
-    (m) => m.role === "user" && m.timestamp === state.task,
-  );
-  const draft = messages
-    .slice(start + 1)
-    .filter((m) => m.role === "assistant" || m.role === "toolResult")
-    .map(
-      (m) =>
-        `${m.role}${m.role === "toolResult" ? ` (${m.toolName}${m.isError ? ", error" : ""})` : ""}: ${text(m)}`,
-    )
-    .join("\n")
-    .slice(-24000);
-  const diff = await pi.exec("git", ["diff", "--no-ext-diff", "--", "."], {
-    cwd: ctx.cwd,
-  });
-  const status = await pi.exec("git", ["status", "--short"], { cwd: ctx.cwd });
-  return `Draft and tool/check results:\n${draft}\n\nGit status (untracked files are listed but not in diff):\n${status.stdout}\nGit diff:\n${diff.stdout.slice(0, 24000)}`;
 }
 export function observedTaskCost(
   ctx: ExtensionContext,
@@ -132,7 +105,7 @@ export default function (pi: ExtensionAPI) {
       const model = physical(ctx, state.author);
       ctx.ui.setStatus(
         "fusion",
-        `${effortLabel(state.effort)} · ${state.workflow} · ${state.phase === "draft" ? "drafting" : state.phase === "revision" ? "revising" : "done"} · ${state.author.provider}/${state.author.id}${state.budgetNote ? ` · ${state.budgetNote}` : ""}`,
+        `${effortLabel(state.effort)} · ${state.workflow} · ${state.phase === "draft" ? "drafting" : state.phase === "revision" ? "revising" : "done"} · ${state.author.provider}/${state.author.id}${state.routeReason ? ` · ${state.routeReason}` : ""}${state.budgetNote ? ` · ${state.budgetNote}` : ""}`,
       );
       return {
         model,
@@ -160,11 +133,16 @@ export default function (pi: ExtensionAPI) {
     const proof =
       state.workflow === "single" || overBudget
         ? ""
-        : await evidence(pi, ctx, state);
+        : await evidence(
+            pi,
+            ctx,
+            state,
+            cfg.reviewEvidence?.includeUntracked ?? false,
+          );
     if (state.workflow !== "single" && !overBudget)
       ctx.ui.setStatus(
         "fusion",
-        `${effortLabel(state.effort)} · ${state.workflow} · ${state.workflow === "cascade" ? "judging" : "reviewing"}`,
+        `${effortLabel(state.effort)} · ${state.workflow} · ${state.workflow === "cascade" ? "judging" : "reviewing"}${state.routeReason ? ` · ${state.routeReason}` : ""}`,
       );
     let transition: Transition;
     if (overBudget) {
@@ -205,7 +183,7 @@ export default function (pi: ExtensionAPI) {
     };
     ctx.ui.setStatus(
       "fusion",
-      `${effortLabel(state.effort)} · ${state.workflow} · ${transition.phase === "revision" ? (state.workflow === "cascade" ? "escalating" : "revising") : "done"} · ${transition.note}`,
+      `${effortLabel(state.effort)} · ${state.workflow} · ${transition.phase === "revision" ? (state.workflow === "cascade" ? "escalating" : "revising") : "done"} · ${transition.note}${state.routeReason ? ` · ${state.routeReason}` : ""}`,
     );
     const entries = [
       ...event.entries,

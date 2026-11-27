@@ -48,6 +48,25 @@ test("config priority: environment > project > XDG > home; separate projects do 
   assert.equal(loadConfig(override).timeoutMs, 15000);
 });
 
+test("new-file review evidence remains opt-in and requires a boolean", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "fusion-evidence-config-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, "fusion.json");
+  for (const [value, valid] of [
+    [{ includeUntracked: true }, true],
+    [{ includeUntracked: "true" }, false],
+    [[], false],
+  ]) {
+    writeFileSync(
+      path,
+      JSON.stringify({ ...JSON.parse(example), reviewEvidence: value }),
+    );
+    if (valid)
+      assert.equal(loadConfig(path).reviewEvidence.includeUntracked, true);
+    else assert.throws(() => loadConfig(path), /reviewEvidence/);
+  }
+});
+
 test("budget fields are optional and invalid settings fail at load", (t) => {
   const root = mkdtempSync(join(tmpdir(), "fusion-budget-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
