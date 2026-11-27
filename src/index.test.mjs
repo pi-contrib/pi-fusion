@@ -1,7 +1,9 @@
 import { strict as assert } from "node:assert";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
-import extension from "./index.ts";
+import extension, { observedTaskCost } from "./index.ts";
 
 process.env.PI_FUSION_CONFIG = resolve("examples/fusion.json");
 const models = ["gpt-5.6-luna", "gpt-5.6-sol"].map((id) => ({
@@ -169,6 +171,107 @@ test("Standard runs one author across tools and retry without evidence or review
   assert.ok(statuses.some((s) => s.includes("Fusion Standard")));
 });
 
+test("soft task cost skips review without interrupting author; review timeout keeps draft", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "fusion-review-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const previous = process.env.PI_FUSION_CONFIG;
+  process.env.PI_FUSION_CONFIG = join(dir, "fusion.json");
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_FUSION_CONFIG;
+    else process.env.PI_FUSION_CONFIG = previous;
+  });
+  const settings = JSON.parse(
+    readFileSync(resolve("examples/fusion.json"), "utf8"),
+  );
+  settings.budget = { maxTaskCostUsd: 0.5, maxReviewMs: 5 };
+  writeFileSync(process.env.PI_FUSION_CONFIG, JSON.stringify(settings));
+  const handlers = {};
+  let executions = 0;
+  extension({
+    registerVirtualModel() {},
+    on: (name, fn) => {
+      handlers[name] = fn;
+    },
+    exec: async () => {
+      executions++;
+      return { stdout: "" };
+    },
+  });
+  const state = {
+    task: 100,
+    request: "Fix",
+    effort: "high",
+    workflow: "critique",
+    tier: "fast",
+    author: { provider: "openai-codex", id: "gpt-5.6-luna" },
+    phase: "draft",
+    reviewerLimit: 2,
+    routingCostUsd: 0.05,
+  };
+  const entries = [
+    { type: "message", message: { role: "user", timestamp: 100 } },
+    {
+      type: "custom",
+      customType: "pi.virtual-model-state",
+      data: { provider: "fusion", state },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: "Draft",
+        usage: { cost: { total: 0.46 } },
+      },
+    },
+  ];
+  let reviewCalls = 0;
+  const ctx = {
+    cwd: dir,
+    model: { provider: "fusion", id: "auto" },
+    ui: { setStatus() {}, notify() {} },
+    sessionManager: { getBranch: () => entries },
+    modelRegistry: {
+      getAvailable: () => [
+        ...models,
+        { provider: "openai-codex", id: "gpt-5.6-sol", api: "mock" },
+      ],
+      streamSimple: () => {
+        reviewCalls++;
+        return {
+          result: () =>
+            new Promise((resolve) =>
+              setTimeout(
+                () =>
+                  resolve({
+                    stopReason: "stop",
+                    content: [{ type: "text", text: '{"findings":"none"}' }],
+                  }),
+                40,
+              ),
+            ),
+        };
+      },
+    },
+  };
+  assert.equal(observedTaskCost(ctx, state), 0.51);
+  let result = await handlers.agent_before_settle(
+    { outcome: "completed", entries: [] },
+    ctx,
+  );
+  assert.equal(result.continue, false);
+  assert.match(result.entries[0].data.phase, /done/);
+  assert.equal(reviewCalls, 0);
+  assert.equal(executions, 0);
+  entries[2].message.usage.cost.total = 0.1;
+  result = await handlers.agent_before_settle(
+    { outcome: "completed", entries: [] },
+    ctx,
+  );
+  assert.equal(result.continue, false);
+  assert.equal(reviewCalls, 2);
+  assert.equal(executions, 2);
+});
+
 test("classifier offers only meaningful choices and rejects contrary answers", async () => {
   const { choose } = await import("./fusion.ts");
   const calls = [];
@@ -177,6 +280,10 @@ test("classifier offers only meaningful choices and rejects contrary answers", a
     fast: { provider: "openai-codex", id: "gpt-5.6-luna" },
     strong: { provider: "openai-codex", id: "gpt-5.6-sol" },
     defaultAuthor: "fast",
+    critics: [
+      { provider: "openai-codex", id: "gpt-5.6-sol" },
+      { provider: "openai-codex", id: "gpt-5.6-luna" },
+    ],
     timeoutMs: 1000,
   };
   let answer;

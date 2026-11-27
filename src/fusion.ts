@@ -22,23 +22,29 @@ export function fusionEffort(level: string): FusionEffort {
 export function effortLabel(effort: FusionEffort): string {
   return `Fusion ${effort[0].toUpperCase()}${effort.slice(1)}`;
 }
-export function routeOptions(effort: FusionEffort): {
+export function routeOptions(
+  effort: FusionEffort,
+  reviewerLimit = Infinity,
+): {
   workflows: Workflow[];
   tiers: Tier[];
 } {
-  return effort === "standard"
-    ? { workflows: ["single"], tiers: ["fast", "strong"] }
-    : effort === "max"
-      ? { workflows: ["single", "critique"], tiers: ["strong"] }
-      : {
-          workflows: ["single", "cascade", "critique"],
-          tiers: ["fast", "strong"],
-        };
+  const workflows: Workflow[] = ["single"];
+  if (effort === "high" && reviewerLimit >= 1) workflows.push("cascade");
+  if (effort !== "standard" && reviewerLimit >= 2) workflows.push("critique");
+  return {
+    workflows,
+    tiers: effort === "max" ? ["strong"] : ["fast", "strong"],
+  };
 }
-export function validateRoute(value: unknown, effort: FusionEffort): Route {
+export function validateRoute(
+  value: unknown,
+  effort: FusionEffort,
+  reviewerLimit = Infinity,
+): Route {
   if (!value || typeof value !== "object") throw new Error("Invalid route");
   const v = value as Record<string, unknown>;
-  const { workflows, tiers } = routeOptions(effort);
+  const { workflows, tiers } = routeOptions(effort, reviewerLimit);
   if (
     !workflows.includes(v.workflow as Workflow) ||
     !tiers.includes(v.tier as Tier)
@@ -56,6 +62,14 @@ export type Config = {
   critics: Ref[];
   defaultAuthor: Tier;
   timeoutMs: number;
+  budget?: {
+    /** Maximum optional reviewer calls; Critique needs at least two. */
+    maxReviewerCalls?: number;
+    /** Soft USD threshold checked before review, never interrupts the author. */
+    maxTaskCostUsd?: number;
+    /** Total wall-clock limit for one review round. */
+    maxReviewMs?: number;
+  };
 };
 export type State = {
   task: number;
@@ -65,6 +79,9 @@ export type State = {
   tier: Tier;
   phase: "draft" | "revision" | "done";
   author: Ref;
+  reviewerLimit?: number;
+  routingCostUsd?: number;
+  budgetNote?: string;
 };
 export type Transition = {
   phase: "done" | "revision";
@@ -160,6 +177,7 @@ async function chat(
   ref: Ref,
   prompt: string,
   signal: AbortSignal,
+  recordCost?: (cost: number) => void,
 ): Promise<string> {
   const result = await ctx.modelRegistry
     .streamSimple(
@@ -168,6 +186,7 @@ async function chat(
       { signal },
     )
     .result();
+  recordCost?.(result.usage?.cost.total ?? 0);
   if (result.stopReason !== "stop")
     throw new Error(
       result.errorMessage ?? `Model stopped: ${result.stopReason}`,
@@ -181,9 +200,11 @@ async function classify(
   ref: Ref,
   request: string,
   effort: FusionEffort,
+  reviewerLimit: number,
   signal: AbortSignal,
+  recordCost: (cost: number) => void,
 ): Promise<Route> {
-  const { workflows, tiers } = routeOptions(effort);
+  const { workflows, tiers } = routeOptions(effort, reviewerLimit);
   const questions = {
     ...(workflows.length > 1
       ? {
@@ -228,6 +249,7 @@ async function classify(
   );
   if (model) {
     const result = await ctx.modelRegistry.classify(model, payload, { signal });
+    recordCost(result.usage?.cost.total ?? 0);
     if (result.stopReason !== "stop")
       throw new Error(result.errorMessage ?? "Classifier failed");
     return validateRoute(
@@ -246,6 +268,7 @@ async function classify(
               : undefined,
       },
       effort,
+      reviewerLimit,
     );
   }
   if (
@@ -270,7 +293,9 @@ async function classify(
   if (!response.ok) throw new Error(`System One HTTP ${response.status}`);
   const data = (await response.json()) as {
     answers?: Record<string, { choice?: string }>;
+    usage?: { cost?: { total?: number } };
   };
+  recordCost(data.usage?.cost?.total ?? 0);
   return validateRoute(
     {
       workflow:
@@ -281,6 +306,7 @@ async function classify(
         (tiers.length === 1 ? tiers[0] : undefined),
     },
     effort,
+    reviewerLimit,
   );
 }
 export async function choose(
@@ -291,7 +317,15 @@ export async function choose(
 ): Promise<State> {
   const original = text(task);
   const effort = fusionEffort(request.thinkingLevel);
-  const allowed = routeOptions(effort);
+  const reviewerCap = config.budget?.maxReviewerCalls ?? Infinity;
+  const reviewerLimit = Math.min(config.critics.length, reviewerCap);
+  const workflowLimit =
+    config.budget?.maxReviewerCalls === undefined ? Infinity : reviewerLimit;
+  const allowed = routeOptions(effort, workflowLimit);
+  let routingCostUsd = 0;
+  const recordCost = (cost: number) => {
+    if (Number.isFinite(cost) && cost > 0) routingCostUsd += cost;
+  };
   let choice: Route;
   try {
     choice = await bounded(
@@ -304,13 +338,22 @@ export async function choose(
             config.router.id,
           )
         )
-          return classify(ctx, config.router, original, effort, signal);
+          return classify(
+            ctx,
+            config.router,
+            original,
+            effort,
+            workflowLimit,
+            signal,
+            recordCost,
+          );
         const answer = parseJson(
           await chat(
             ctx,
             config.router,
             `${routePrompt}\nTask: ${original}\nFusion effort: ${effort}\nAllowed workflows: ${allowed.workflows.join(", ")}\nAllowed initial tiers: ${allowed.tiers.join(", ")} (Cascade always starts fast).\nReturn JSON only with workflow${allowed.tiers.length > 1 ? " and tier" : ""}.`,
             signal,
+            recordCost,
           ),
         );
         return validateRoute(
@@ -325,6 +368,7 @@ export async function choose(
               (allowed.tiers.length === 1 ? allowed.tiers[0] : undefined),
           },
           effort,
+          workflowLimit,
         );
       },
       request.signal,
@@ -341,11 +385,26 @@ export async function choose(
       tier: effort === "max" ? "strong" : config.defaultAuthor,
     };
   }
+  const costLimitReached =
+    config.budget?.maxTaskCostUsd !== undefined &&
+    routingCostUsd >= config.budget.maxTaskCostUsd;
+  if (costLimitReached)
+    choice = {
+      workflow: "single",
+      tier: effort === "max" ? "strong" : choice.tier,
+    };
   return {
     task: task.timestamp,
     request: original,
     effort,
     ...choice,
+    reviewerLimit,
+    routingCostUsd,
+    budgetNote: costLimitReached
+      ? "Router cost reached task soft limit; review disabled"
+      : allowed.workflows.length < routeOptions(effort).workflows.length
+        ? `Review cap ${reviewerLimit} restricts workflows`
+        : undefined,
     author: config[choice.tier],
     phase: "draft",
   };
@@ -434,22 +493,24 @@ export async function review(
     }
   }
   const results = await Promise.all(
-    config.critics.map(async (ref) => {
-      try {
-        const answer = parseJson(
-          await bounded(
-            (s) => chat(ctx, ref, `${criticPrompt}\n${prompt}`, s),
-            signal,
-            config.timeoutMs,
-          ),
-        );
-        if (typeof answer.findings !== "string")
-          throw new Error("invalid findings");
-        return { finding: `${ref.provider}/${ref.id}: ${answer.findings}` };
-      } catch (error) {
-        return { failure: `${ref.provider}/${ref.id}: ${String(error)}` };
-      }
-    }),
+    config.critics
+      .slice(0, state.reviewerLimit ?? config.critics.length)
+      .map(async (ref) => {
+        try {
+          const answer = parseJson(
+            await bounded(
+              (s) => chat(ctx, ref, `${criticPrompt}\n${prompt}`, s),
+              signal,
+              config.timeoutMs,
+            ),
+          );
+          if (typeof answer.findings !== "string")
+            throw new Error("invalid findings");
+          return { finding: `${ref.provider}/${ref.id}: ${answer.findings}` };
+        } catch (error) {
+          return { failure: `${ref.provider}/${ref.id}: ${String(error)}` };
+        }
+      }),
   );
   if (signal?.aborted) throw signal.reason;
   return advance(state, config, {
