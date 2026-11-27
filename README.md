@@ -6,11 +6,38 @@ One selectable virtual model for [Pi](https://pi.dev) with task-aware Standard, 
 
 Select `fusion/auto` once, then use Pi's thinking-level selector. Pi's visible labels remain **Low / Medium / High / XHigh**; Fusion maps **Low and Medium → Fusion Standard**, **High → Fusion High**, and **XHigh → Fusion Max**. Pi 1.6.1 does not support custom virtual-model thinking-level labels. Fusion Fast is not user-selectable. Low and Medium share the Standard orchestration policy but retain their respective physical-model reasoning budgets.
 
+The diagram is an orientation map of one task's lifecycle; the prose below is normative and covers the precedence rules (overrides, reviewer caps, cost limits, fallbacks) that do not fit in a chart.
+
+```mermaid
+flowchart TD
+  E["Pi level<br/>Low/Medium = Standard, High = High, XHigh = Max"] --> R{"Route: rubric within effort, reviewer cap, override"}
+  R -->|"any effort"| S["Single: one author drafts"]
+  R -->|"High, reviewer limit 1+"| C["Cascade: fast author drafts"]
+  R -->|"High or Max, reviewer limit 2+"| K["Critique: one author drafts"]
+  S --> D(["Draft completes; tools, retries and streamed output run normally"])
+  C --> D
+  K --> D
+  D --> B{"agent_before_settle"}
+  B -->|"Single, cancelled, review skipped or timed out"| Z(["Done"])
+  B -->|"Cascade: judge accepts"| Z
+  B -->|"Cascade: judge escalates"| X["Strong author revises once"] --> Z
+  B -->|"Critique: reviewers return findings"| Y["Same author revises once"] --> Z
+  B -->|"no usable review: judge error or every critic failed"| Z2(["Done, incomplete review"])
+```
+
 The router applies the same task-aware rubric within each effort's allowed choices. **Standard** always runs Single, choosing fast or strong once without judges or critics. **High** can choose Single, fast-first Cascade, or Critique; Single and Critique may start fast or strong. **Max** always starts strong and chooses Single for straightforward tasks or parallel Critique when risk or complexity warrants it; Cascade is excluded. The chosen physical author works in Pi's ordinary streaming agent loop, including tools and retries. The initial draft may be visible before review.
 
 - **Single**: one author completes the task without review.
 - **Cascade**: an efficient author drafts; after its tool work finishes, a judge accepts or escalates. Acceptance ends immediately; escalation sends specific findings and evidence to the configured stronger author for one revision.
 - **Critique**: one author drafts; configured critics evaluate the same draft independently in parallel. Their separate findings, including disagreements, go back to the **original** author for one revision. Critics have no tools or write access.
+
+| Workflow | Initial author | Reviewers | After review | Available at |
+| --- | --- | --- | --- | --- |
+| **Single** | fast or strong | none | no revision | every effort |
+| **Cascade** | fast (fixed) | one judge | strong author, one revision | High, reviewer limit ≥ 1 |
+| **Critique** | fast or strong | one to N critics in parallel | same author, one revision | High and Max, reviewer limit ≥ 2 |
+
+Reviewers never get tools or write access, and Max pins every author to strong. "Reviewer limit" is `min(critics.length, budget.maxReviewerCalls)`, so Critique needs at least two configured critics; a cap of `0` leaves only Single.
 
 Reviews start at Pi's `agent_before_settle` boundary, after automatic recovery and queued work. A task has at most one review round and one revision. The active author alone can edit. Continuations and retries preserve the current author; direct calls route to the default physical author. State follows session branches. Status displays Fusion Standard/High/Max, the workflow, author, and current drafting/judging/reviewing/escalation/revision stage; the draft and review/revision can appear as separate streamed responses. Unstaged and staged Git diffs/status and the recorded tool/check results accompany the draft. Untracked contents require an explicit opt-in. Checks are not run automatically by Fusion.
 
