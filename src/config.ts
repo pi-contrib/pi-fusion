@@ -42,6 +42,15 @@ export function loadConfig(path: string): Config {
   parsed.timeoutMs ??= 15000;
   if (!positive(parsed.timeoutMs))
     throw new Error(`Invalid timeoutMs in ${path}`);
+  if (
+    parsed.reviewEvidence !== undefined &&
+    (typeof parsed.reviewEvidence !== "object" ||
+      parsed.reviewEvidence === null ||
+      Array.isArray(parsed.reviewEvidence) ||
+      (typeof parsed.reviewEvidence.includeUntracked !== "undefined" &&
+        typeof parsed.reviewEvidence.includeUntracked !== "boolean"))
+  )
+    throw new Error(`Invalid reviewEvidence in ${path}`);
   const budget = parsed.budget;
   if (
     budget &&

@@ -15,6 +15,36 @@ export type Workflow = "single" | "cascade" | "critique";
 export type Tier = "fast" | "strong";
 export type FusionEffort = "standard" | "high" | "max";
 export type Route = { workflow: Workflow; tier: Tier };
+export type RouteSignal =
+  | "straightforward"
+  | "complex"
+  | "fast-draft"
+  | "review-risk";
+const routeSignals: RouteSignal[] = [
+  "straightforward",
+  "complex",
+  "fast-draft",
+  "review-risk",
+];
+export function routeExplanation(
+  signal: unknown,
+  workflow: Workflow,
+  tier: Tier,
+): string {
+  const consistent =
+    signal === "fast-draft"
+      ? workflow === "cascade"
+      : signal === "review-risk"
+        ? workflow === "critique"
+        : signal === "complex"
+          ? workflow === "single" && tier === "strong"
+          : signal === "straightforward"
+            ? workflow === "single"
+            : false;
+  return consistent && routeSignals.includes(signal as RouteSignal)
+    ? `router signal: ${signal}`
+    : `policy: ${workflow}`;
+}
 
 export function fusionEffort(level: string): FusionEffort {
   return level === "xhigh" ? "max" : level === "high" ? "high" : "standard";
@@ -62,6 +92,7 @@ export type Config = {
   critics: Ref[];
   defaultAuthor: Tier;
   timeoutMs: number;
+  reviewEvidence?: { includeUntracked?: boolean };
   budget?: {
     /** Maximum optional reviewer calls; Critique needs at least two. */
     maxReviewerCalls?: number;
@@ -82,6 +113,7 @@ export type State = {
   reviewerLimit?: number;
   routingCostUsd?: number;
   budgetNote?: string;
+  routeReason?: string;
 };
 export type Transition = {
   phase: "done" | "revision";
@@ -203,6 +235,7 @@ async function classify(
   reviewerLimit: number,
   signal: AbortSignal,
   recordCost: (cost: number) => void,
+  recordSignal: (signal: unknown) => void,
 ): Promise<Route> {
   const { workflows, tiers } = routeOptions(effort, reviewerLimit);
   const questions = {
@@ -224,6 +257,17 @@ async function classify(
           },
         }
       : {}),
+    signal: {
+      type: "choice" as const,
+      instructions:
+        "Select one short task signal from the shared route rubric. Use straightforward or complex for Single, fast-draft for Cascade, review-risk for Critique.",
+      criteria: {
+        straightforward: "Clear bounded task",
+        complex: "Clear task requiring a stronger author",
+        "fast-draft": "Fast draft with an escalation gate",
+        "review-risk": "Ambiguous, high-risk or cross-cutting task",
+      },
+    },
     ...(tiers.length > 1
       ? {
           tier: {
@@ -252,7 +296,7 @@ async function classify(
     recordCost(result.usage?.cost.total ?? 0);
     if (result.stopReason !== "stop")
       throw new Error(result.errorMessage ?? "Classifier failed");
-    return validateRoute(
+    const route = validateRoute(
       {
         workflow:
           result.answers.workflow?.type === "choice"
@@ -270,6 +314,12 @@ async function classify(
       effort,
       reviewerLimit,
     );
+    recordSignal(
+      result.answers.signal?.type === "choice"
+        ? result.answers.signal.choice
+        : undefined,
+    );
+    return route;
   }
   if (
     ref.provider !== "opencode" ||
@@ -296,7 +346,7 @@ async function classify(
     usage?: { cost?: { total?: number } };
   };
   recordCost(data.usage?.cost?.total ?? 0);
-  return validateRoute(
+  const route = validateRoute(
     {
       workflow:
         data.answers?.workflow?.choice ??
@@ -308,6 +358,8 @@ async function classify(
     effort,
     reviewerLimit,
   );
+  recordSignal(data.answers?.signal?.choice);
+  return route;
 }
 export async function choose(
   ctx: ExtensionContext,
@@ -327,6 +379,11 @@ export async function choose(
     if (Number.isFinite(cost) && cost > 0) routingCostUsd += cost;
   };
   let choice: Route;
+  let signalChoice: unknown;
+  let fallback = false;
+  const recordSignal = (signal: unknown) => {
+    signalChoice = signal;
+  };
   try {
     choice = await bounded(
       async (signal) => {
@@ -346,17 +403,18 @@ export async function choose(
             workflowLimit,
             signal,
             recordCost,
+            recordSignal,
           );
         const answer = parseJson(
           await chat(
             ctx,
             config.router,
-            `${routePrompt}\nTask: ${original}\nFusion effort: ${effort}\nAllowed workflows: ${allowed.workflows.join(", ")}\nAllowed initial tiers: ${allowed.tiers.join(", ")} (Cascade always starts fast).\nReturn JSON only with workflow${allowed.tiers.length > 1 ? " and tier" : ""}.`,
+            `${routePrompt}\nTask: ${original}\nFusion effort: ${effort}\nAllowed workflows: ${allowed.workflows.join(", ")}\nAllowed initial tiers: ${allowed.tiers.join(", ")} (Cascade always starts fast).\nReturn JSON only with workflow${allowed.tiers.length > 1 ? ", tier" : ""}, and signal (straightforward|complex|fast-draft|review-risk).`,
             signal,
             recordCost,
           ),
         );
-        return validateRoute(
+        const route = validateRoute(
           {
             workflow:
               answer.workflow ??
@@ -370,12 +428,15 @@ export async function choose(
           effort,
           workflowLimit,
         );
+        recordSignal(answer.signal);
+        return route;
       },
       request.signal,
       config.timeoutMs,
     );
   } catch (error) {
     if (request.signal?.aborted) throw error;
+    fallback = true;
     ctx.ui.setStatus(
       "fusion",
       `${effortLabel(effort)} · Routing unavailable; Single (${effort === "max" ? "strong" : "default author"})`,
@@ -400,6 +461,11 @@ export async function choose(
     ...choice,
     reviewerLimit,
     routingCostUsd,
+    routeReason: costLimitReached
+      ? "task cost limit"
+      : fallback
+        ? "routing unavailable"
+        : routeExplanation(signalChoice, choice.workflow, choice.tier),
     budgetNote: costLimitReached
       ? "Router cost reached task soft limit; review disabled"
       : allowed.workflows.length < routeOptions(effort).workflows.length

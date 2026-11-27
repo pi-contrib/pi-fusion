@@ -12,6 +12,7 @@
     "src/index.ts",
     "src/fusion.ts",
     "src/config.ts",
+    "src/evidence.ts",
     "src/prompts.ts"
   ],
   "pi": {

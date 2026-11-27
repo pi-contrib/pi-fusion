@@ -17,7 +17,10 @@
         checks.default =
           pkgs.runCommand "pi-fusion-check"
             {
-              nativeBuildInputs = [ pkgs.nodejs_22 ];
+              nativeBuildInputs = [
+                pkgs.nodejs_22
+                pkgs.git
+              ];
               src = ./.;
             }
             ''

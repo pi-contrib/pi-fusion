@@ -7,6 +7,7 @@ import {
   fusionEffort,
   parseRoute,
   review,
+  routeExplanation,
   routeOptions,
   validateRoute,
 } from "./fusion.ts";
@@ -179,6 +180,56 @@ test("reported router cost can disable optional review before drafting", async (
   assert.equal(routed.tier, "strong");
   assert.equal(routed.routingCostUsd, 0.6);
   assert.match(routed.budgetNote, /review disabled/);
+  assert.equal(routed.routeReason, "task cost limit");
+});
+test("chat routing records consistent categorical signal without an extra call", async () => {
+  for (const [reply, expected] of [
+    [
+      '{"workflow":"single","tier":"fast","signal":"straightforward"}',
+      "router signal: straightforward",
+    ],
+    [
+      '{"workflow":"single","tier":"strong","signal":"complex"}',
+      "router signal: complex",
+    ],
+    [
+      '{"workflow":"cascade","tier":"fast","signal":"fast-draft"}',
+      "router signal: fast-draft",
+    ],
+    [
+      '{"workflow":"critique","tier":"strong","signal":"review-risk"}',
+      "router signal: review-risk",
+    ],
+    [
+      '{"workflow":"single","tier":"fast","signal":"review-risk"}',
+      "policy: single",
+    ],
+    [
+      '{"workflow":"single","tier":"fast","signal":"complex"}',
+      "policy: single",
+    ],
+    [
+      '{"workflow":"single","tier":"fast","signal":"some untrusted free text"}',
+      "policy: single",
+    ],
+    ['{"workflow":"single","tier":"fast"}', "policy: single"],
+  ]) {
+    const ctx = mock({ router: reply });
+    const result = await choose(ctx, config, { thinkingLevel: "high" }, user);
+    assert.equal(result.routeReason, expected);
+    assert.equal(ctx.calls.length, 1);
+  }
+  assert.equal(
+    routeExplanation(undefined, "cascade", "fast"),
+    "policy: cascade",
+  );
+  const fallback = await choose(
+    mock({ router: '{"workflow":"invalid","signal":"review-risk"}' }),
+    config,
+    { thinkingLevel: "xhigh" },
+    user,
+  );
+  assert.equal(fallback.routeReason, "routing unavailable");
 });
 test("routing timeout falls back by effort; cancellation propagates", async () => {
   const ctx = mock(
