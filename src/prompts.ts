@@ -1,0 +1,7 @@
+export const routePrompt = `Choose a task-aware route within the supplied Fusion effort's allowed choices. Standard always uses Single: choose fast for straightforward low-risk work and strong when complexity calls for it. High may use Single for clear work, Cascade for a fast-first draft with a possible strong escalation, or Critique when independent review is warranted by ambiguity, risk, or cross-cutting changes. Max always starts strong: choose Single for obviously straightforward work, otherwise Critique for work that benefits from parallel independent review. Cascade always starts fast and is unavailable at Max. Select an initial tier only where offered; never select strong for Cascade. Use the same rubric for classifier and structured chat routing. Return only the requested choices.`;
+
+export const judgePrompt = `Evaluate the completed draft against the original request and evidence. Return JSON only: {"decision":"accept"|"escalate","findings":"specific actionable findings"}. Accept if complete; escalate only for concrete defects or missing requirements.`;
+
+export const criticPrompt = `Independently evaluate the draft against the original request and evidence. Return JSON only: {"findings":"specific defects or omissions with evidence, or none"}. You have read-only context; do not modify the workspace.`;
+
+export const revisePrompt = `Verify each finding against the original request and evidence. Resolve confirmed issues, preserve meaningful disagreements, and finish the original task. This is the only revision; do not request another review.`;
