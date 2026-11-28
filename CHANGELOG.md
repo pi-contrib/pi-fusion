@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/pi-contrib/pi-fusion/compare/v0.2.0...v0.2.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* rename virtual model display label to Auto ([797ae4c](https://github.com/pi-contrib/pi-fusion/commit/797ae4cb72d4f8526028c8327ec1a351f2d5c3ae))
+
 ## [0.2.0](https://github.com/pi-contrib/pi-fusion/compare/v0.1.0...v0.2.0) (2026-11-28)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "@pi-contrib/pi-fusion",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Single, Cascade, and Critique virtual-model workflows for Pi",
   "license": "MIT",
   "type": "module",
