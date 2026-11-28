@@ -9,26 +9,36 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { type TestContext, test } from "node:test";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { evidence, untrackedEvidence } from "./evidence.ts";
 import { review } from "./fusion.ts";
+import {
+  createMockChatContext,
+  draftState,
+  mockConfig,
+} from "./test-helpers.ts";
 
-function fixture(t) {
+function fixture(t: TestContext) {
   const cwd = mkdtempSync(join(tmpdir(), "fusion-evidence-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   execFileSync("git", ["init", "-q"], { cwd });
-  const commands = [];
+  const commands: string[][] = [];
   const pi = {
-    exec: async (command, args) => {
+    exec: async (command: string, args: string[]) => {
       commands.push(args);
       const result = spawnSync(command, args, { cwd, encoding: "utf8" });
       return {
-        code: result.status,
+        code: result.status ?? 1,
         stdout: result.stdout ?? "",
         stderr: result.stderr ?? "",
+        killed: false,
       };
     },
-  };
+  } as unknown as ExtensionAPI;
   const ctx = {
     cwd,
     signal: undefined,
@@ -45,8 +55,8 @@ function fixture(t) {
         },
       ],
     },
-  };
-  const state = { task: 101, request: "test", workflow: "critique" };
+  } as unknown as ExtensionContext;
+  const state = draftState("critique", { request: "test" });
   return { cwd, pi, ctx, state, commands };
 }
 
@@ -90,54 +100,28 @@ test("judge and parallel critics receive the same bounded evidence", async (t) =
   const { cwd, pi, ctx, state } = fixture(t);
   writeFileSync(join(cwd, "test.txt"), "NEW TEST");
   const proof = await evidence(pi, ctx, state, true);
-  const calls = [];
-  const config = {
-    judge: { provider: "mock", id: "judge" },
-    critics: [
-      { provider: "mock", id: "c1" },
-      { provider: "mock", id: "c2" },
-    ],
-    timeoutMs: 1000,
-  };
-  ctx.modelRegistry = {
-    getAvailable: () =>
-      [config.judge, ...config.critics].map((ref) => ({ ...ref, api: "mock" })),
-    streamSimple: (model, context) => {
-      calls.push({ id: model.id, prompt: context.messages[0].content });
-      return {
-        result: async () => ({
-          stopReason: "stop",
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text:
-                model.id === "judge"
-                  ? '{"decision":"accept","findings":""}'
-                  : '{"findings":"none"}',
-            },
-          ],
-        }),
-      };
-    },
-  };
+  const mock = createMockChatContext({
+    judge: '{"decision":"accept","findings":""}',
+    c1: '{"findings":"none"}',
+    c2: '{"findings":"none"}',
+  });
   await review(
-    ctx,
-    config,
-    { ...state, phase: "draft", author: config.judge, workflow: "cascade" },
+    mock.ctx,
+    mockConfig,
+    { ...state, author: mockConfig.judge, workflow: "cascade" },
     proof,
   );
   await review(
-    ctx,
-    config,
-    { ...state, phase: "draft", author: config.judge, workflow: "critique" },
+    mock.ctx,
+    mockConfig,
+    { ...state, author: mockConfig.judge, workflow: "critique" },
     proof,
   );
   assert.deepEqual(
-    calls.map((call) => call.id),
+    mock.calls.map((call) => call.id),
     ["judge", "c1", "c2"],
   );
-  for (const call of calls) assert.match(call.prompt, /NEW TEST/);
+  for (const call of mock.calls) assert.match(call.prompt, /NEW TEST/);
 });
 
 test("new-file evidence rejects sensitive names, symlinks, binaries, oversized and unsafe paths", async (t) => {
@@ -160,13 +144,13 @@ test("new-file evidence rejects sensitive names, symlinks, binaries, oversized a
   );
   assert.match(result, /omitted/);
   const bad = {
-    ...pi,
     exec: async () => ({
       code: 0,
       stdout: `../${outside.split("/").at(-1)}\0nested/okay.txt\0`,
       stderr: "",
+      killed: false,
     }),
-  };
+  } as unknown as ExtensionAPI;
   const guarded = await untrackedEvidence(bad, ctx);
   assert.match(guarded, /SAFE CONTENT/);
   assert.doesNotMatch(guarded, /SECRET OUTSIDE/);
@@ -191,14 +175,24 @@ test("caps new-file count and bytes, reports Git failures and truncates diffs", 
   assert.match(byteCapped, /File "bytes\/0.txt/);
   assert.doesNotMatch(byteCapped, /File "bytes\/3.txt/);
   const failed = {
-    exec: async () => ({ code: 128, stdout: "", stderr: "not a git repo" }),
-  };
+    exec: async () => ({
+      code: 128,
+      stdout: "",
+      stderr: "not a git repo",
+      killed: false,
+    }),
+  } as unknown as ExtensionAPI;
   const unavailable = await evidence(failed, ctx, state, true);
   assert.match(unavailable, /\[unavailable\]/);
   assert.match(unavailable, /untracked file listing unavailable/);
   const giant = {
-    exec: async () => ({ code: 0, stdout: "+".repeat(50000), stderr: "" }),
-  };
+    exec: async () => ({
+      code: 0,
+      stdout: "+".repeat(50000),
+      stderr: "",
+      killed: false,
+    }),
+  } as unknown as ExtensionAPI;
   const bounded = await evidence(giant, ctx, state);
   assert.match(bounded, /\[truncated/);
   assert.ok(bounded.length < 60000);

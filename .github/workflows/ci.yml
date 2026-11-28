@@ -18,7 +18,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run lint
-      - run: npm test
+      - run: npm run test:coverage
       - run: npm pack --dry-run
 
   release:
