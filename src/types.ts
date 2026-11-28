@@ -1,6 +1,6 @@
 export const FUSION_PROVIDER = "fusion";
 export const FUSION_MODEL_ID = "fusion-auto";
-export const FUSION_MODEL_NAME = "Fusion (auto)";
+export const FUSION_MODEL_NAME = "Auto";
 
 export type Ref = { provider: string; id: string };
 export type Workflow = "single" | "cascade" | "critique";

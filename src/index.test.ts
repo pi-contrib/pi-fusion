@@ -28,7 +28,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
   const ext = mountExtension();
   assert.equal(ext.definition.provider, "fusion");
   assert.equal(ext.definition.id, "fusion-auto");
-  assert.equal(ext.definition.name, "Fusion (auto)");
+  assert.equal(ext.definition.name, "Auto");
   const statuses: Array<string | undefined> = [];
   const workingMessages: Array<string | undefined> = [];
   const user = userMessage("Fix this", 100);
