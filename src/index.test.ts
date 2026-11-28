@@ -15,7 +15,9 @@ import { type Config, choose, type State } from "./fusion.ts";
 import { observedTaskCost } from "./index.ts";
 import {
   exampleCatalog,
+  fusionModelRef,
   mountExtension,
+  readWidgetLine,
   routeRequest,
   userMessage,
 } from "./test-helpers.ts";
@@ -25,13 +27,22 @@ process.env.PI_FUSION_CONFIG = resolve("examples/fusion.json");
 test("virtual route persists through tool continuations and retry; direct uses default; branch revision switches author", async () => {
   const ext = mountExtension();
   assert.equal(ext.definition.provider, "fusion");
+  assert.equal(ext.definition.id, "fusion-auto");
+  assert.equal(ext.definition.name, "Fusion (auto)");
   const statuses: Array<string | undefined> = [];
+  const workingMessages: Array<string | undefined> = [];
   const user = userMessage("Fix this", 100);
   const ctx = {
     cwd: process.cwd(),
     ui: {
-      setStatus: (_key: string, value: string | undefined) => {
-        statuses.push(value);
+      setWidget: (
+        _key: string,
+        content: Parameters<typeof readWidgetLine>[0],
+      ) => {
+        statuses.push(readWidgetLine(content));
+      },
+      setWorkingMessage: (msg?: string) => {
+        workingMessages.push(msg);
       },
       notify() {},
     },
@@ -58,7 +69,8 @@ test("virtual route persists through tool continuations and retry; direct uses d
   assert.equal(first.state?.effort, "high");
   assert.equal(first.state?.workflow, "cascade");
   assert.equal(first.state?.routeReason, "router signal: fast-draft");
-  assert.ok(statuses.some((s) => s?.includes("router signal: fast-draft")));
+  assert.equal(statuses.at(-1), undefined);
+  assert.equal(workingMessages.at(-1), "Drafting with gpt-5.6-luna · High");
   const next = await ext.route(
     routeRequest([user], "high", {
       reason: "continuation",
@@ -68,7 +80,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
     ctx,
   );
   assert.equal(next.model.id, first.model.id);
-  assert.ok(statuses.at(-1)?.includes(first.state?.routeReason ?? ""));
+  assert.equal(workingMessages.at(-1), "Drafting with gpt-5.6-luna · High");
   const retry = await ext.route(
     routeRequest([user], "high", {
       reason: "retry",
@@ -114,7 +126,8 @@ test("virtual route persists through tool continuations and retry; direct uses d
     "gpt-5.6-sol",
   );
   assert.ok(ext.handlers.agent_before_settle);
-  assert.ok(statuses.at(-1)?.includes(first.state?.routeReason ?? ""));
+  assert.equal(statuses.at(-1), undefined);
+  assert.equal(workingMessages.at(-1), "Revising with gpt-5.6-sol · High");
   // A fork with the saved route but without the revision marker retains its original author.
   ext.entries.pop();
   const fork = await ext.route(
@@ -125,7 +138,7 @@ test("virtual route persists through tool continuations and retry; direct uses d
     ctx,
   );
   assert.equal(fork.model.id, "gpt-5.6-luna");
-  assert.ok(statuses.at(-1)?.includes(first.state?.routeReason ?? ""));
+  assert.equal(workingMessages.at(-1), "Drafting with gpt-5.6-luna · High");
 });
 
 test("Standard runs one author across tools and retry without evidence or review", async () => {
@@ -146,11 +159,15 @@ test("Standard runs one author across tools and retry without evidence or review
   const user = userMessage("Fix this", 102);
   const ctx = {
     cwd: process.cwd(),
-    model: { provider: "fusion", id: "auto" },
+    model: fusionModelRef,
     ui: {
-      setStatus: (_key: string, value: string | undefined) => {
-        statuses.push(value);
+      setWidget: (
+        _key: string,
+        content: Parameters<typeof readWidgetLine>[0],
+      ) => {
+        statuses.push(readWidgetLine(content));
       },
+      setWorkingMessage() {},
       notify() {},
     },
     sessionManager: { getBranch: () => ext.entries },
@@ -187,7 +204,9 @@ test("Standard runs one author across tools and retry without evidence or review
   );
   assert.equal(settled?.continue, false);
   assert.equal(executions, 0);
-  assert.ok(statuses.some((s) => s?.includes("Fusion Standard")));
+  assert.ok(
+    statuses.some((s) => s?.includes("Completed with gpt-5.6-sol · Standard")),
+  );
 });
 
 test("soft task cost skips review without interrupting author; review timeout keeps draft", async (t) => {
@@ -253,9 +272,10 @@ test("soft task cost skips review without interrupting author; review timeout ke
   const notices: Array<{ message: string; type?: string }> = [];
   const ctx = {
     cwd: dir,
-    model: { provider: "fusion", id: "auto" },
+    model: fusionModelRef,
     ui: {
-      setStatus() {},
+      setWidget() {},
+      setWorkingMessage() {},
       notify: (message: string, type?: string) =>
         notices.push({ message, type }),
     },

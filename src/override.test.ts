@@ -16,7 +16,9 @@ import type { State } from "./fusion.ts";
 import { pendingOverride } from "./index.ts";
 import {
   exampleCatalog,
+  fusionModelRef,
   mountExtension,
+  readWidgetLine,
   routeRequest,
   userMessage,
 } from "./test-helpers.ts";
@@ -31,13 +33,18 @@ function setup() {
   const calls: Array<{ questions: Record<string, unknown> }> = [];
   const ctx = {
     cwd: process.cwd(),
-    model: { provider: "fusion", id: "auto" },
+    model: fusionModelRef,
     thinkingLevel: "high",
+    hasUI: false,
     isIdle: () => true,
     ui: {
-      setStatus: (_key: string, value: string | undefined) => {
-        statuses.push(value);
+      setWidget: (
+        _key: string,
+        content: Parameters<typeof readWidgetLine>[0],
+      ) => {
+        statuses.push(readWidgetLine(content));
       },
+      setWorkingMessage() {},
       notify: (text: string) => {
         notices.push(text);
       },
@@ -77,13 +84,13 @@ test("one-shot command persists through branches and reload, not continuations, 
   const s = setup();
   await s.command("critique", s.ctx);
   assert.equal(pendingOverride(s.ctx), "critique");
-  assert.ok(s.statuses.at(-1)?.includes("next task: critique"));
+  assert.ok(s.statuses.at(-1)?.includes("Next task: Critique"));
   const branchBefore = [...s.entries];
   await s.sessionStart?.(
     { type: "session_start", reason: "reload" } as SessionStartEvent,
     s.ctx,
   );
-  assert.ok(s.statuses.at(-1)?.includes("next task: critique"));
+  assert.ok(s.statuses.at(-1)?.includes("Next task: Critique"));
   assert.equal(
     (
       await s.route(
@@ -173,7 +180,7 @@ test("command rejects bad input, busy or wrong model; replacement and clear are 
   await s.command("auto", s.ctx);
   assert.equal(pendingOverride(s.ctx), undefined);
   assert.equal(s.entries.length, 3);
-  assert.ok(s.notices.some((notice) => notice.includes("cleared")));
+  assert.ok(s.notices.some((notice) => notice.includes("adaptive routing")));
   // Switching sessions changes the branch, not a process-global pending variable.
   await s.command("cascade", s.ctx);
   const otherSession = {

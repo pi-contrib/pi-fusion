@@ -10,6 +10,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
   ExtensionVirtualModel,
+  MessageRenderer,
   ModelRoute,
   ModelRouteReason,
   ModelRouteRequest,
@@ -21,9 +22,21 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import extension from "./index.ts";
 import { text } from "./model.ts";
-import type { Config, Ref, State, Workflow } from "./types.ts";
+import {
+  type Config,
+  FUSION_MODEL_ID,
+  FUSION_PROVIDER,
+  type Ref,
+  type State,
+  type Workflow,
+} from "./types.ts";
 
 export const ref = (id: string, provider = "mock"): Ref => ({ provider, id });
+
+export const fusionModelRef = {
+  provider: FUSION_PROVIDER,
+  id: FUSION_MODEL_ID,
+};
 
 export const mockConfig: Config = {
   router: ref("router"),
@@ -101,6 +114,18 @@ export type StreamCall = {
   signal: AbortSignal | undefined;
 };
 
+export function readWidgetLine(
+  content:
+    | string[]
+    | ((...args: never[]) => { render(width: number): readonly string[] })
+    | undefined,
+  width = 120,
+): string | undefined {
+  if (!content) return undefined;
+  if (Array.isArray(content)) return content[0];
+  return content().render(width)[0];
+}
+
 export function createMockChatContext(
   reply: Record<string, string | Error>,
   options: {
@@ -111,6 +136,7 @@ export function createMockChatContext(
 ) {
   const calls: StreamCall[] = [];
   const statuses: Array<string | undefined> = [];
+  const workingMessages: Array<string | undefined> = [];
   const notices: NoticeRecord[] = [];
   const delay = options.delay ?? (() => Promise.resolve());
   const available = options.available ?? mockCatalog;
@@ -120,6 +146,18 @@ export function createMockChatContext(
     ui: {
       setStatus: (_key: string, value: string | undefined) => {
         statuses.push(value);
+      },
+      setWidget: (
+        _key: string,
+        content:
+          | string[]
+          | ((...args: never[]) => { render(width: number): readonly string[] })
+          | undefined,
+      ) => {
+        statuses.push(readWidgetLine(content));
+      },
+      setWorkingMessage: (message?: string) => {
+        workingMessages.push(message);
       },
       notify: (message: string, type?: "info" | "warning" | "error") => {
         notices.push({ message, type });
@@ -168,6 +206,7 @@ export function createMockChatContext(
     raw: ctx,
     calls,
     statuses,
+    workingMessages,
     notices,
   };
 }
@@ -207,6 +246,7 @@ export function mountExtension(
 ) {
   const entries: SessionEntry[] = [];
   const handlers: MountedHandlers = {};
+  const renderers = new Map<string, MessageRenderer>();
   let definition: ExtensionVirtualModel<State> | undefined;
   let command: Omit<RegisteredCommand, "name" | "sourceInfo"> | undefined;
   let commandName: string | undefined;
@@ -220,6 +260,9 @@ export function mountExtension(
     ) {
       commandName = name;
       command = opts;
+    },
+    registerMessageRenderer(customType: string, renderer: MessageRenderer) {
+      renderers.set(customType, renderer);
     },
     on(name: string, fn: (...args: never[]) => unknown) {
       (handlers as Record<string, unknown>)[name] = fn;
@@ -255,6 +298,7 @@ export function mountExtension(
     command: (args: string, ctx: ExtensionContext) =>
       registeredCommand.handler(args, ctx as ExtensionCommandContext),
     completions: registeredCommand.getArgumentCompletions,
+    renderers,
     handlers,
     entries,
   };

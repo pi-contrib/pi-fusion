@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import type {
   AgentBeforeSettleEvent,
+  AgentSettledEvent,
   ExtensionContext,
   ModelRouteRequest,
   ModelSelectEvent,
@@ -20,7 +21,6 @@ import {
   describeTask,
   parseJson,
   review,
-  reviewNotice,
   revisionMessage,
   type State,
   type Transition,
@@ -29,8 +29,10 @@ import {
   createMockChatContext,
   draftState,
   exampleCatalog,
+  fusionModelRef,
   mockConfig,
   mountExtension,
+  readWidgetLine,
   ref,
   userMessage,
 } from "./test-helpers.ts";
@@ -130,7 +132,10 @@ test("routing and review failures warn the user and log underlying errors outsid
   assert.equal(state.routeReason, "routing unavailable");
   assert.equal(notices.length, 1);
   assert.equal(notices[0]?.type, "warning");
-  assert.match(notices[0]?.message ?? "", /routing failed.*Single/);
+  assert.match(
+    notices[0]?.message ?? "",
+    /Router unavailable.*continuing with fast/,
+  );
   assert.equal(logged.length, 1);
   assert.match(String(logged[0]?.[0]), /routing failed/);
 
@@ -158,16 +163,29 @@ test("session_start and model_select validate configured models, clear status on
   });
   const ext = mountExtension();
   const notices: Array<{ message: string; type?: string }> = [];
-  const statuses: Array<string | undefined> = [];
+  const bars: Array<string | undefined> = [];
+  const workingMessages: Array<string | undefined> = [];
+  let selectOptions: string[] = [];
   const ctx = {
     cwd: process.cwd(),
     mode: "tui",
-    model: { provider: "fusion", id: "auto" },
+    hasUI: true,
+    model: fusionModelRef,
     thinkingLevel: "high",
     isIdle: () => true,
     ui: {
-      setStatus: (_key: string, value: string | undefined) => {
-        statuses.push(value);
+      setWidget: (
+        _key: string,
+        content: Parameters<typeof readWidgetLine>[0],
+      ) => {
+        bars.push(readWidgetLine(content));
+      },
+      setWorkingMessage: (msg?: string) => {
+        workingMessages.push(msg);
+      },
+      select: async (_title: string, options: string[]) => {
+        selectOptions = options;
+        return options.find((o) => o.startsWith("Critique"));
       },
       notify: (message: string, type?: string) => {
         notices.push({ message, type });
@@ -189,9 +207,23 @@ test("session_start and model_select validate configured models, clear status on
     notices.at(-1)?.message ?? "",
     /unavailable models.*typesafe\/jev-latest.*openai-codex\/gpt-5\.6-sol/,
   );
+  assert.match(bars.at(-1) ?? "", /◆ Fusion · High/);
 
-  // Queue /fusion critique at high, then switch thinking level to low -> immediate warning.
-  await ext.command("critique", ctx);
+  // Bare /fusion opens interactive selector and queues the chosen workflow.
+  await ext.command("", ctx);
+  assert.ok(selectOptions.some((o) => o.startsWith("Auto (adaptive)")));
+  assert.ok(selectOptions.some((o) => o.startsWith("Critique")));
+  assert.match(bars.at(-1) ?? "", /◆ Next task: Critique · High/);
+
+  // /fusion status reports config path, allowed workflows, and model availability.
+  await ext.command("status", ctx);
+  assert.match(notices.at(-1)?.message ?? "", /Fusion status \(High\)/);
+  assert.match(
+    notices.at(-1)?.message ?? "",
+    /Next task: Critique \(override\)/,
+  );
+
+  // Switching thinking level to low warns immediately about incompatible queued override.
   await ext.handlers.thinking_level_select?.(
     {
       type: "thinking_level_select",
@@ -206,20 +238,21 @@ test("session_start and model_select validate configured models, clear status on
     /incompatible with Fusion Standard/,
   );
 
-  // Switching away from fusion/auto clears the footer status.
+  // Switching away from fusion-auto clears the above-editor widget and working message.
   await ext.handlers.model_select?.(
     {
       type: "model_select",
       model: { provider: "openai-codex", id: "gpt-5.6-sol" },
-      previousModel: { provider: "fusion", id: "auto" },
+      previousModel: fusionModelRef,
       source: "set",
     } as unknown as ModelSelectEvent,
     ctx,
   );
-  assert.equal(statuses.at(-1), undefined);
+  assert.equal(bars.at(-1), undefined);
+  assert.equal(workingMessages.at(-1), undefined);
 });
 
-test("visible review UX posts reviewer disclosure once, verdict summary notice, and display:true labeled revision message", async (t) => {
+test("visible review UX registers custom card renderer, deduplicates toasts, updates spinner, and settles post-revision bar", async (t) => {
   const previous = process.env.PI_FUSION_CONFIG;
   process.env.PI_FUSION_CONFIG = resolve("examples/fusion.json");
   t.after(() => {
@@ -227,6 +260,7 @@ test("visible review UX posts reviewer disclosure once, verdict summary notice, 
     else process.env.PI_FUSION_CONFIG = previous;
   });
   const ext = mountExtension();
+  assert.ok(ext.renderers.has("fusion.revise"));
   const state: State = {
     task: 10,
     request: "Add parser test",
@@ -248,11 +282,21 @@ test("visible review UX posts reviewer disclosure once, verdict summary notice, 
     } as SessionEntry,
   );
   const notices: Array<{ message: string; type?: string }> = [];
+  const bars: Array<string | undefined> = [];
+  const workingMessages: Array<string | undefined> = [];
   const ctx = {
     cwd: process.cwd(),
-    model: { provider: "fusion", id: "auto" },
+    model: fusionModelRef,
     ui: {
-      setStatus() {},
+      setWidget: (
+        _key: string,
+        content: Parameters<typeof readWidgetLine>[0],
+      ) => {
+        bars.push(readWidgetLine(content));
+      },
+      setWorkingMessage: (msg?: string) => {
+        workingMessages.push(msg);
+      },
       notify: (message: string, type?: string) =>
         notices.push({ message, type }),
     },
@@ -278,33 +322,37 @@ test("visible review UX posts reviewer disclosure once, verdict summary notice, 
     ctx,
   );
   assert.equal(settled?.continue, true);
-  // First review discloses the judge model, then posts the verdict + findings summary.
-  assert.equal(notices.length, 2);
-  assert.match(notices[0]?.message ?? "", /sends your request.*gpt-5\.6-sol/);
-  assert.match(
-    notices[1]?.message ?? "",
-    /Fusion review \(judge escalated\): Missing edge-case assertion.*revising/,
+  // First review discloses reviewer model once, and skips duplicate info toast when revision card renders.
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]?.message ?? "", /Review will share.*gpt-5\.6-sol/);
+  assert.ok(
+    workingMessages.includes("Reviewing draft with gpt-5.6-sol · High"),
   );
+  assert.equal(workingMessages.at(-1), "Revising with gpt-5.6-sol · High");
+  // Above-editor widget stays hidden while streaming so only Pi's working border shows.
+  assert.equal(bars.at(-1), undefined);
   const reviseEntry = settled?.entries?.find(
     (e) => e.type === "custom_message",
   );
   assert.equal(reviseEntry?.type, "custom_message");
   if (reviseEntry?.type === "custom_message") {
     assert.equal(reviseEntry.display, true);
-    assert.match(String(reviseEntry.content), /^\*\*Fusion review \(judge\)/);
+    assert.ok(reviseEntry.details);
     assert.doesNotMatch(String(reviseEntry.content), /Unstaged Git diff:/);
   }
 
-  // Second review on the same config does not repeat the disclosure notice.
-  const second = await ext.handlers.agent_before_settle?.(
-    { outcome: "completed", entries: [] } as unknown as AgentBeforeSettleEvent,
+  // Persist the phase entry as Pi does, then fire agent_settled after revision finishes.
+  const phaseEntry = settled?.entries?.find((e) => e.type === "custom");
+  if (phaseEntry) ext.entries.push(phaseEntry as unknown as SessionEntry);
+  await ext.handlers.agent_settled?.(
+    { type: "agent_settled", aborted: false } as AgentSettledEvent,
     ctx,
   );
-  assert.equal(second?.continue, true);
-  assert.equal(notices.length, 3);
+  assert.equal(workingMessages.at(-1), undefined);
+  assert.equal(bars.at(-1), "✓ Revised with gpt-5.6-sol after review");
 });
 
-test("image attachments and labeled revision helpers format cleanly", () => {
+test("image attachments and revision message helper format cleanly", () => {
   const message = userMessage([
     { type: "text", text: "Look" },
     { type: "image", data: "x", mimeType: "image/png" },
@@ -318,11 +366,7 @@ test("image attachments and labeled revision helpers format cleanly", () => {
     note: "Critique revision",
     feedback: "missing test",
   };
-  assert.match(
-    revisionMessage(state, transition),
-    /^\*\*Fusion review \(critics\)/,
-  );
-  assert.match(reviewNotice(state, transition), /missing test — revising/);
+  assert.match(revisionMessage(state, transition), /missing test/);
 });
 
 test("diffs and status exclude tracked sensitive files and sensitive directories", async (t) => {

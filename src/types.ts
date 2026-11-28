@@ -1,8 +1,13 @@
+export const FUSION_PROVIDER = "fusion";
+export const FUSION_MODEL_ID = "fusion-auto";
+export const FUSION_MODEL_NAME = "Fusion (auto)";
+
 export type Ref = { provider: string; id: string };
 export type Workflow = "single" | "cascade" | "critique";
 export type Tier = "fast" | "strong";
 export type FusionEffort = "standard" | "high" | "max";
 export type Route = { workflow: Workflow; tier: Tier };
+export type Outcome = "accepted" | "revised" | "skipped" | "degraded";
 export type RouteSignal =
   | "straightforward"
   | "complex"
@@ -52,6 +57,16 @@ export type State = {
   budgetNote?: string;
   routeReason?: string;
   override?: Workflow;
+  outcome?: Outcome;
+  outcomeNote?: string;
+};
+
+export type PhaseUpdate = {
+  task: number;
+  phase: State["phase"];
+  author: Ref;
+  outcome?: Outcome;
+  note?: string;
 };
 
 export type Transition = {
@@ -59,4 +74,16 @@ export type Transition = {
   author: Ref;
   feedback?: string;
   note: string;
+  outcome?: Outcome;
+  findingsList?: string[];
+  failuresList?: string[];
+};
+
+export type ReviseDetails = {
+  workflow: Exclude<Workflow, "single">;
+  effort: FusionEffort;
+  author: Ref;
+  reviewerCount: number;
+  findings: string[];
+  failures: string[];
 };

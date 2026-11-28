@@ -1,12 +1,17 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { bounded, chat, logFailure, parseJson } from "./model.ts";
 import { criticPrompt, judgePrompt, revisePrompt } from "./prompts.ts";
-import type { Config, State, Transition } from "./types.ts";
+import type { Config, ReviseDetails, State, Transition } from "./types.ts";
 
 export function advance(
   state: State,
   config: Config,
-  result: { decision?: string; findings?: string; failures?: string[] },
+  result: {
+    decision?: string;
+    findings?: string;
+    findingsList?: string[];
+    failures?: string[];
+  },
 ): Transition {
   if (state.phase !== "draft")
     return {
@@ -17,20 +22,35 @@ export function advance(
   if (state.workflow === "single")
     return { phase: "done", author: state.author, note: "Single complete" };
   const failures = result.failures ?? [];
+  const findingsList =
+    result.findingsList ??
+    (result.findings ? [result.findings].filter(Boolean) : []);
   if (state.workflow === "cascade") {
     if (result.decision === "accept")
-      return { phase: "done", author: state.author, note: "Judge accepted" };
-    if (result.decision === "escalate")
+      return {
+        phase: "done",
+        author: state.author,
+        note: "Review passed",
+        outcome: "accepted",
+      };
+    if (result.decision === "escalate") {
+      const feedback = result.findings || "Judge requested escalation";
       return {
         phase: "revision",
         author: config.strong,
-        feedback: result.findings || "Judge requested escalation",
-        note: "Escalation",
+        feedback,
+        note: "Review requested changes",
+        outcome: "revised",
+        findingsList: findingsList.length ? findingsList : [feedback],
+        failuresList: [],
       };
+    }
     return {
       phase: "done",
       author: state.author,
       note: `Judge could not complete: ${failures.join("; ") || "invalid decision"}`,
+      outcome: "degraded",
+      failuresList: failures,
     };
   }
   if (!result.findings && failures.length)
@@ -38,6 +58,8 @@ export function advance(
       phase: "done",
       author: state.author,
       note: `Review could not complete: ${failures.join("; ")}`,
+      outcome: "degraded",
+      failuresList: failures,
     };
   return {
     phase: "revision",
@@ -49,6 +71,9 @@ export function advance(
       .filter(Boolean)
       .join("\n"),
     note: "Critique revision",
+    outcome: "revised",
+    findingsList,
+    failuresList: failures,
   };
 }
 
@@ -78,6 +103,10 @@ export async function review(
         return advance(state, config, {
           decision: answer.decision as string,
           findings: answer.findings as string,
+          findingsList:
+            typeof answer.findings === "string" && answer.findings.length > 0
+              ? [answer.findings]
+              : [],
         });
       throw new Error("invalid judge response");
     } catch (error) {
@@ -109,32 +138,38 @@ export async function review(
       }),
   );
   if (signal?.aborted) throw signal.reason;
+  const findingsList = results
+    .map((r) => ("finding" in r ? r.finding : undefined))
+    .filter((v): v is string => Boolean(v));
+  const failures = results
+    .map((r) => ("failure" in r ? r.failure : undefined))
+    .filter((v): v is string => Boolean(v));
   return advance(state, config, {
-    findings: results
-      .map((r) => ("finding" in r ? r.finding : ""))
-      .filter(Boolean)
-      .join("\n"),
-    failures: results
-      .map((r) => ("failure" in r ? r.failure : ""))
-      .filter(Boolean) as string[],
+    findings: findingsList.join("\n"),
+    findingsList,
+    failures,
   });
 }
 
-/** Concise one-line notice summarizing the review verdict and findings. */
-export function reviewNotice(state: State, transition: Transition): string {
-  if (transition.phase !== "revision")
-    return `Fusion review: ${transition.note}`;
-  const summary = (transition.feedback ?? "").replace(/\s+/g, " ").trim();
-  const clipped = summary.length > 120 ? `${summary.slice(0, 119)}…` : summary;
-  const label =
-    state.workflow === "cascade" ? "judge escalated" : "critics reviewed";
-  return clipped
-    ? `Fusion review (${label}): ${clipped} — revising`
-    : `Fusion review (${label}): revising`;
+/** Structured metadata rendered by the custom `fusion.revise` TUI card. */
+export function reviseDetails(
+  state: State,
+  transition: Transition,
+  reviewerCount: number,
+): ReviseDetails {
+  return {
+    workflow: state.workflow === "cascade" ? "cascade" : "critique",
+    effort: state.effort,
+    author: transition.author,
+    reviewerCount,
+    findings:
+      transition.findingsList ??
+      (transition.feedback ? [transition.feedback] : []),
+    failures: transition.failuresList ?? [],
+  };
 }
 
-/** Visible to the user and the author; the author already holds the draft in its own transcript. */
+/** Revision instructions sent to the author; TUI renders `ReviseDetails` via `renderReviseCard`. */
 export function revisionMessage(state: State, transition: Transition): string {
-  const label = state.workflow === "cascade" ? "judge" : "critics";
-  return `**Fusion review (${label}): ${transition.note}**\n\n${revisePrompt}\n\nOriginal request:\n${state.request}\n\nFindings (verify independently):\n${transition.feedback ?? "none"}`;
+  return `${revisePrompt}\n\nOriginal request:\n${state.request}\n\nFindings (verify independently):\n${transition.feedback ?? "none"}`;
 }

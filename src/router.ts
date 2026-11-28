@@ -15,6 +15,7 @@ import {
   type Tier,
   type Workflow,
 } from "./types.ts";
+import { modelLabel, setFusionBar, workingLabel } from "./ui.ts";
 
 export function routeExplanation(
   signal: unknown,
@@ -253,6 +254,8 @@ export async function choose(
   const recordSignal = (signal: unknown) => {
     signalChoice = signal;
   };
+  setFusionBar(ctx, undefined);
+  ctx.ui.setWorkingMessage?.(workingLabel({ kind: "routing", effort }));
   try {
     choice = await bounded(
       async (signal) => {
@@ -314,18 +317,16 @@ export async function choose(
     if (request.signal?.aborted) throw error;
     fallback = true;
     logFailure(ctx, "routing failed", error);
-    const author = effort === "max" ? "strong" : "default";
-    ctx.ui.setStatus(
-      "fusion",
-      `${effortLabel(effort)} · Routing unavailable; ${forced ?? "Single"} (${author} author)`,
-    );
+    const tier: Tier = effort === "max" ? "strong" : config.defaultAuthor;
+    const authorLabel = modelLabel(config[tier], config);
+    const reason = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(
-      `Fusion routing failed (${error instanceof Error ? error.message : String(error)}); using ${forced ?? "Single"} with the ${author} author`,
+      `Router unavailable (${reason}) — continuing with ${authorLabel}.`,
       "warning",
     );
     choice = {
       workflow: forced ?? "single",
-      tier: effort === "max" ? "strong" : config.defaultAuthor,
+      tier,
     };
   }
   const costLimitReached =
