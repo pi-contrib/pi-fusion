@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/pi-contrib/pi-fusion/compare/v0.1.0...v0.2.0) (2026-11-28)
+
+
+### Features
+
+* report all config errors with field paths and configured refs ([87e3d2c](https://github.com/pi-contrib/pi-fusion/commit/87e3d2c732562d3144195c54106b33db136dddb6))
+* surface review verdicts, labeled revisions, and startup checks ([aa62e74](https://github.com/pi-contrib/pi-fusion/commit/aa62e74f39ca5133f4f74ea64e9eb2d0d239e3ed))
+* **ui:** overhaul status line, review card, and virtual model UX ([2b412e7](https://github.com/pi-contrib/pi-fusion/commit/2b412e728a08a02026f5cf90b9c57dae301ab2db))
+
+
+### Bug Fixes
+
+* exclude sensitive paths from review diffs and status ([d7c3262](https://github.com/pi-contrib/pi-fusion/commit/d7c3262e9e596d6aa1a7aa338fb3e8c598964081))
+
 ## 0.1.0 (2026-11-27)
 
 
