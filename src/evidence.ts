@@ -11,14 +11,38 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { State } from "./fusion.ts";
-import { text } from "./fusion.ts";
+import { text } from "./model.ts";
+import type { State } from "./types.ts";
 
 const MAX_DIFF = 24000;
 const MAX_STATUS = 8000;
 const MAX_FILES = 10;
 const MAX_FILE_BYTES = 16 * 1024;
 const MAX_TOTAL_BYTES = 32 * 1024;
+
+/** Git pathspec equivalents of `sensitive()`, covering both filenames and directory segments. */
+const SENSITIVE_PATTERNS = [
+  ".env",
+  ".env.*",
+  ".npmrc",
+  ".pypirc",
+  ".netrc",
+  "*secret*",
+  "*credential*",
+  "*private*key*",
+  "*api*key*",
+  "*token*",
+  "*id_rsa*",
+  "*id_ed25519*",
+  "*.key",
+  "*.pem",
+  "*.p12",
+  "*.pfx",
+];
+const SENSITIVE_PATHSPECS = SENSITIVE_PATTERNS.flatMap((pattern) => [
+  `:(exclude,glob,icase)**/${pattern}`,
+  `:(exclude,glob,icase)**/${pattern}/**`,
+]);
 
 function boundedSection(value: string, limit: number): string {
   return value.length > limit
@@ -169,7 +193,14 @@ export async function evidence(
     )
     .join("\n");
   const [unstaged, staged, status] = await Promise.all([
-    git(pi, ctx, ["diff", "--no-ext-diff", "--no-textconv", "--", "."]),
+    git(pi, ctx, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--",
+      ".",
+      ...SENSITIVE_PATHSPECS,
+    ]),
     git(pi, ctx, [
       "diff",
       "--cached",
@@ -177,8 +208,9 @@ export async function evidence(
       "--no-textconv",
       "--",
       ".",
+      ...SENSITIVE_PATHSPECS,
     ]),
-    git(pi, ctx, ["status", "--short"]),
+    git(pi, ctx, ["status", "--short", "--", ".", ...SENSITIVE_PATHSPECS]),
   ]);
   const untracked = includeUntracked
     ? await untrackedEvidence(pi, ctx)
