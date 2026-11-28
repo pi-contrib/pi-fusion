@@ -2,7 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { configPath, loadConfig } from "./config.ts";
+import { configPath, configuredRefs, loadConfig } from "./config.ts";
 import { evidence } from "./evidence.ts";
 import {
   advance,
@@ -13,8 +13,10 @@ import {
   fusionEffort,
   isWorkflow,
   lastUser,
+  logFailure,
   physical,
   review,
+  reviewNotice,
   revisionMessage,
   routeOptions,
   type State,
@@ -22,6 +24,16 @@ import {
   type Workflow,
   workflowLimit,
 } from "./fusion.ts";
+
+function formatStatus(...parts: (string | undefined)[]): string {
+  return parts.filter(Boolean).join(" · ");
+}
+
+function isFusionModel(
+  model: { provider?: string; id?: string } | undefined,
+): boolean {
+  return model?.provider === "fusion" && model.id === "auto";
+}
 
 function branchState(ctx: ExtensionContext): State | undefined {
   const branch = ctx.sessionManager.getBranch();
@@ -50,6 +62,7 @@ function branchState(ctx: ExtensionContext): State | undefined {
     ? { ...base, phase: update.phase, author: update.author }
     : base;
 }
+
 export function pendingOverride(
   ctx: ExtensionContext,
   task?: number,
@@ -61,7 +74,7 @@ export function pendingOverride(
   if (index < 0) return;
   const selected = branch[index];
   const value =
-    selected.type === "custom"
+    selected?.type === "custom"
       ? (selected.data as { workflow?: unknown } | undefined)?.workflow
       : undefined;
   if (typeof value !== "string" || !isWorkflow(value)) return;
@@ -119,6 +132,46 @@ export default function (pi: ExtensionAPI) {
     }
     return cfg;
   };
+  const activateFusion = (ctx: ExtensionContext) => {
+    try {
+      const cfg = load(ctx.cwd);
+      const available = new Set(
+        ctx.modelRegistry
+          .getAvailable()
+          .filter((m) => m.api !== "pi-virtual")
+          .map((m) => `${m.provider}/${m.id}`),
+      );
+      const missing = configuredRefs(cfg)
+        .map((ref) => `${ref.provider}/${ref.id}`)
+        .filter((name) => !available.has(name));
+      const routerKey = `${cfg.router.provider}/${cfg.router.id}`;
+      const routerAvailable =
+        available.has(routerKey) ||
+        Boolean(
+          ctx.modelRegistry.findOfType?.(
+            "classifier",
+            cfg.router.provider,
+            cfg.router.id,
+          ),
+        );
+      if (!routerAvailable && !missing.includes(routerKey))
+        missing.unshift(routerKey);
+      if (missing.length)
+        ctx.ui.notify(
+          `Fusion config references unavailable models: ${missing.join(", ")}`,
+          "warning",
+        );
+    } catch (error) {
+      logFailure(ctx, "invalid configuration", error);
+      ctx.ui.notify(
+        error instanceof Error ? error.message : String(error),
+        "error",
+      );
+    }
+    const queued = pendingOverride(ctx);
+    if (queued) ctx.ui.setStatus("fusion", `Fusion · next task: ${queued}`);
+  };
+
   pi.registerCommand("fusion", {
     description:
       "Force Single, Cascade or Critique for the next Fusion task; auto clears",
@@ -127,11 +180,7 @@ export default function (pi: ExtensionAPI) {
         .filter((value) => value.startsWith(prefix.trim().toLowerCase()))
         .map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
-      if (
-        ctx.model?.provider !== "fusion" ||
-        ctx.model.id !== "auto" ||
-        !ctx.isIdle()
-      ) {
+      if (!isFusionModel(ctx.model) || !ctx.isIdle()) {
         ctx.ui.notify(
           "Select fusion/auto and wait for the agent to finish first",
           "warning",
@@ -171,12 +220,54 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+
+  const disclosed = new Set<string>();
+  /** Tell the user once per config which remote models will see their code. */
+  const discloseReviewers = (
+    ctx: ExtensionContext,
+    cfg: Config,
+    state: State,
+  ) => {
+    const path = configPath(ctx.cwd);
+    if (disclosed.has(path)) return;
+    disclosed.add(path);
+    const reviewers =
+      state.workflow === "cascade"
+        ? [cfg.judge]
+        : cfg.critics.slice(0, state.reviewerLimit ?? cfg.critics.length);
+    ctx.ui.notify(
+      `Fusion review sends your request, draft, tool output and Git diffs to: ${reviewers.map((r) => `${r.provider}/${r.id}`).join(", ")}`,
+      "info",
+    );
+  };
+
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.model?.provider === "fusion" && ctx.model.id === "auto") {
-      const queued = pendingOverride(ctx);
-      if (queued) ctx.ui.setStatus("fusion", `Fusion · next task: ${queued}`);
+    if (isFusionModel(ctx.model)) activateFusion(ctx);
+  });
+
+  pi.on("model_select", (event, ctx) => {
+    if (isFusionModel(event.model)) activateFusion(ctx);
+    else if (isFusionModel(event.previousModel))
+      ctx.ui.setStatus("fusion", undefined);
+  });
+
+  pi.on("thinking_level_select", (event, ctx) => {
+    if (!isFusionModel(ctx.model)) return;
+    const queued = pendingOverride(ctx);
+    if (!queued) return;
+    try {
+      const effort = fusionEffort(event.level);
+      const allowed = routeOptions(effort, workflowLimit(load(ctx.cwd)));
+      if (!allowed.workflows.includes(queued))
+        ctx.ui.notify(
+          `Queued /fusion ${queued} is incompatible with ${effortLabel(effort)}; switch back or run /fusion auto`,
+          "warning",
+        );
+    } catch {
+      // Config errors are already reported on activation.
     }
   });
+
   pi.registerVirtualModel<State>({
     provider: "fusion",
     id: "auto",
@@ -219,7 +310,18 @@ export default function (pi: ExtensionAPI) {
       const model = physical(ctx, state.author);
       ctx.ui.setStatus(
         "fusion",
-        `${effortLabel(state.effort)} · ${state.workflow} · ${state.phase === "draft" ? "drafting" : state.phase === "revision" ? "revising" : "done"} · ${state.author.provider}/${state.author.id}${state.routeReason ? ` · ${state.routeReason}` : ""}${state.budgetNote ? ` · ${state.budgetNote}` : ""}`,
+        formatStatus(
+          effortLabel(state.effort),
+          state.workflow,
+          state.phase === "draft"
+            ? "drafting"
+            : state.phase === "revision"
+              ? "revising"
+              : "done",
+          `${state.author.provider}/${state.author.id}`,
+          state.routeReason,
+          state.budgetNote,
+        ),
       );
       return {
         model,
@@ -228,13 +330,9 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
   pi.on("agent_before_settle", async (event, ctx) => {
-    if (
-      ctx.model?.provider !== "fusion" ||
-      ctx.model.id !== "auto" ||
-      event.outcome !== "completed"
-    )
-      return;
+    if (!isFusionModel(ctx.model) || event.outcome !== "completed") return;
     const cfg = load(ctx.cwd);
     const state = branchState(ctx);
     if (state?.phase !== "draft") return;
@@ -253,12 +351,20 @@ export default function (pi: ExtensionAPI) {
             state,
             cfg.reviewEvidence?.includeUntracked ?? false,
           );
-    if (state.workflow !== "single" && !overBudget)
+    if (state.workflow !== "single" && !overBudget) {
+      discloseReviewers(ctx, cfg, state);
       ctx.ui.setStatus(
         "fusion",
-        `${effortLabel(state.effort)} · ${state.workflow} · ${state.workflow === "cascade" ? "judging" : "reviewing"}${state.routeReason ? ` · ${state.routeReason}` : ""}`,
+        formatStatus(
+          effortLabel(state.effort),
+          state.workflow,
+          state.workflow === "cascade" ? "judging" : "reviewing",
+          state.routeReason,
+        ),
       );
+    }
     let transition: Transition;
+    let degraded = overBudget;
     if (overBudget) {
       transition = {
         phase: "done" as const,
@@ -276,6 +382,8 @@ export default function (pi: ExtensionAPI) {
         );
       } catch (error) {
         if (ctx.signal?.aborted) throw error;
+        degraded = true;
+        logFailure(ctx, "review timed out", error);
         transition = {
           phase: "done" as const,
           author: state.author,
@@ -285,11 +393,14 @@ export default function (pi: ExtensionAPI) {
     } else {
       transition = await review(ctx, cfg, state, proof, ctx.signal);
     }
-    if (
+    const incomplete =
+      degraded ||
       transition.note.includes("could not complete") ||
-      transition.feedback?.includes("Review could not complete")
-    )
+      Boolean(transition.feedback?.includes("Review could not complete"));
+    if (incomplete)
       ctx.ui.notify(transition.feedback ?? transition.note, "warning");
+    else if (state.workflow !== "single")
+      ctx.ui.notify(reviewNotice(state, transition), "info");
     const data = {
       task: state.task,
       phase: transition.phase,
@@ -297,24 +408,36 @@ export default function (pi: ExtensionAPI) {
     };
     ctx.ui.setStatus(
       "fusion",
-      `${effortLabel(state.effort)} · ${state.workflow} · ${transition.phase === "revision" ? (state.workflow === "cascade" ? "escalating" : "revising") : "done"} · ${transition.note}${state.routeReason ? ` · ${state.routeReason}` : ""}`,
+      formatStatus(
+        effortLabel(state.effort),
+        state.workflow,
+        transition.phase === "revision"
+          ? state.workflow === "cascade"
+            ? "escalating"
+            : "revising"
+          : "done",
+        transition.note,
+        state.routeReason,
+      ),
     );
     const entries = [
       ...event.entries,
       { type: "custom" as const, customType: "fusion.phase", data },
     ];
+    // The revision request is shown, labeled, so users can see why a second answer follows.
     if (transition.phase === "revision")
       entries.push({
         type: "custom_message" as const,
         customType: "fusion.revise",
-        content: revisionMessage(state, transition, proof),
-        display: false,
+        content: revisionMessage(state, transition),
+        display: true,
       } as (typeof entries)[number]);
     // Revision runs in Pi's normal tool-capable loop. This boundary never schedules a second review.
     return { entries, continue: transition.phase === "revision" };
   });
+
   pi.on("agent_settled", (event, ctx) => {
-    if (event.aborted)
+    if (event.aborted && isFusionModel(ctx.model))
       ctx.ui.setStatus("fusion", "Fusion · Cancelled; review skipped");
   });
 }
